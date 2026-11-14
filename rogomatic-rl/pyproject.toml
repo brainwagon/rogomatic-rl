@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Modern Rog-O-Matic using PyTorch, Gymnasium, and reinforcement learning on Rogue 5.4"
 requires-python = ">=3.9"
 dependencies = [
-    "gymnasium>=0.29.1",
+    "gymnasium>=1.1.0",
     "numpy>=1.26.0",
     "pyte>=0.8.2",
     "torch>=2.2.0",

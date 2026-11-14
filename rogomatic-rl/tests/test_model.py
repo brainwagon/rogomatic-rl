@@ -68,3 +68,38 @@ def test_ppo_smoke_train(tmp_path: Path) -> None:
     resumed_ckpt = torch.load(resumed_ckpt_path, map_location="cpu", weights_only=True)
     assert resumed_ckpt["global_step"] == 64
     assert resumed_ckpt["update"] == 2
+
+
+def test_interrupted_training_saves_completed_progress(tmp_path: Path, monkeypatch) -> None:
+    import rogomatic_rl.ppo as ppo
+
+    cfg = PPOConfig(
+        total_timesteps=64,
+        num_envs=2,
+        num_steps=16,
+        max_episode_steps=50,
+        update_epochs=1,
+        num_minibatches=2,
+        checkpoint_dir=str(tmp_path),
+        save_interval=100,  # no periodic save would happen before the interrupt
+    )
+
+    # Two gradient steps per update: interrupt in the middle of update 2.
+    calls = {"n": 0}
+    real_clip = ppo.nn.utils.clip_grad_norm_
+
+    def interrupting_clip(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise KeyboardInterrupt
+        return real_clip(*args, **kwargs)
+
+    monkeypatch.setattr(ppo.nn.utils, "clip_grad_norm_", interrupting_clip)
+    ckpt_path = train_ppo(cfg)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    # Only the fully completed update is recorded, so a resume repeats update 2.
+    assert ckpt["update"] == 1
+    assert ckpt["global_step"] == 32
+    # The atomic write leaves no temp file behind.
+    assert [p.name for p in tmp_path.iterdir()] == [ckpt_path.name]

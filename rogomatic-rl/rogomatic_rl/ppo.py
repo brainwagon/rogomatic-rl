@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -24,7 +25,7 @@ class PPOConfig:
     total_timesteps: int = 100_000
     num_envs: int = 4
     num_steps: int = 128
-    max_episode_steps: int = 1000
+    max_episode_steps: int = 2000
     learning_rate: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -51,6 +52,16 @@ def _make_env(max_episode_steps: int) -> Callable[[], gym.Env]:
         return gym.wrappers.RecordEpisodeStatistics(env)
 
     return _thunk
+
+
+def _save_checkpoint(path: Path, payload: dict) -> None:
+    """Write a checkpoint atomically: temp file in the same directory, then rename.
+
+    A reader (or a crash) never sees a half-written file at ``path``.
+    """
+    tmp_path = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def train_ppo(cfg: PPOConfig) -> Path:
@@ -112,6 +123,23 @@ def train_ppo(cfg: PPOConfig) -> Path:
                 )
 
     initial_global_step = global_step
+    # Progress as of the last fully completed update, for interrupt saves.
+    completed_update = start_update - 1
+    completed_step = global_step
+
+    def save(update_num: int, step_num: int) -> None:
+        _save_checkpoint(
+            latest_ckpt,
+            {
+                "model_state_dict": agent.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "config": asdict(cfg),
+                "global_step": step_num,
+                "update": update_num,
+                "best_level": best_level,
+                "best_gold": best_gold,
+            },
+        )
     start_time = time.time()
     recent_returns: list[float] = []
 
@@ -281,19 +309,21 @@ def train_ppo(cfg: PPOConfig) -> Path:
                 flush=True,
             )
 
+            completed_update = update
+            completed_step = global_step
+
             if update % cfg.save_interval == 0 or update == num_updates:
-                torch.save(
-                    {
-                        "model_state_dict": agent.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "config": asdict(cfg),
-                        "global_step": global_step,
-                        "update": update,
-                        "best_level": best_level,
-                        "best_gold": best_gold,
-                    },
-                    latest_ckpt,
-                )
+                save(update, global_step)
+    except KeyboardInterrupt:
+        # Ctrl-C or `timeout --signal=INT`: keep the work since the last
+        # periodic save.  The interrupted update is recorded as not done,
+        # so a resume repeats it.
+        save(completed_update, completed_step)
+        print(
+            f"Interrupted; saved checkpoint at update={completed_update} "
+            f"step={completed_step}",
+            flush=True,
+        )
     finally:
         envs.close()
 
