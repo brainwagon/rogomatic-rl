@@ -434,3 +434,54 @@ def test_dungeons_are_random_unless_fixed_dungeons_is_set() -> None:
         env.close()
 
     assert not np.array_equal(first["screen"], again["screen"])
+
+
+def _mask_at(lines: list[str], pos: tuple[int, int]) -> np.ndarray:
+    env = _fake_env({}, lines)
+    return env._compute_action_mask(screen_to_array(lines), pos)
+
+
+def _room(center: str = "@") -> list[str]:
+    """A 3x3 patch of room floor around the player at (5, 5)."""
+    lines = _blank_screen()
+    lines = _with(lines, 4, 4, "...")
+    lines = _with(lines, 5, 4, f".{center}.")
+    lines = _with(lines, 6, 4, "...")
+    return lines
+
+
+def test_only_attacking_is_legal_next_to_a_monster() -> None:
+    lines = _with(_room(), 5, 6, "H")  # hobgoblin to the right
+
+    mask = _mask_at(lines, (5, 5))
+
+    assert [ACTIONS[i] for i in np.flatnonzero(mask)] == ["l"]
+
+
+def test_policy_chooses_between_several_adjacent_monsters() -> None:
+    lines = _with(_room(), 5, 6, "H")  # right
+    lines = _with(lines, 4, 4, "K")  # up-left
+
+    mask = _mask_at(lines, (5, 5))
+
+    assert [ACTIONS[i] for i in np.flatnonzero(mask)] == ["l", "y"]
+
+
+def test_monster_across_a_blocked_diagonal_does_not_force_an_attack() -> None:
+    # The snake is up-right, but a wall above the player blocks that
+    # diagonal, so Rogue would refuse the attack.
+    lines = _with(_room(), 4, 5, "-S")
+
+    mask = _mask_at(lines, (5, 5))
+
+    assert mask[5] == 0  # u: the blocked diagonal toward the snake
+    assert mask[0] == 1 and mask[3] == 1  # h and l: free to move
+
+
+def test_mask_is_unchanged_with_no_monster_adjacent() -> None:
+    lines = _with(_room(), 5, 8, "H")  # two tiles away, with floor between
+    lines = _with(lines, 5, 7, ".")
+
+    mask = _mask_at(lines, (5, 5))
+
+    assert int(mask[:8].sum()) == 8  # every direction is open floor

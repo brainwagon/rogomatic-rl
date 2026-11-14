@@ -426,6 +426,23 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                         if orth_r in _WALL_CHARS or orth_c in _WALL_CHARS:
                             mask[idx] = 0
 
+            # Fight back: when an adjacent monster can be attacked, attacking
+            # is the only legal action.  The move toward it must have survived
+            # the wall and diagonal rules above, as Rogue refuses a diagonal
+            # attack past a wall.  With several targets the policy chooses.
+            attack_moves = [
+                idx
+                for idx, (dr, dc) in enumerate(_MOVE_DELTAS)
+                if mask[idx] == 1
+                and 1 <= pr + dr <= 22
+                and 0 <= pc + dc < 80
+                and "A" <= chr(int(screen_arr[pr + dr, pc + dc])) <= "Z"
+            ]
+            if attack_moves:
+                mask[:] = 0
+                mask[attack_moves] = 1
+                return mask
+
             # Mask '.' (rest) when at full HP with no adjacent monster
             if self._status.hp >= self._status.max_hp and not monster_adjacent:
                 mask[8] = 0
