@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import gymnasium as gym
 import numpy as np
+import pytest
 from gymnasium.utils.env_checker import check_env
 
 from rogomatic_rl import ACTIONS, RogueEnv
-from rogomatic_rl.parser import parse_status, screen_to_array
+from rogomatic_rl.parser import is_death_or_end_screen, parse_status, screen_to_array
 
 
 def test_parse_status() -> None:
@@ -98,3 +99,232 @@ def test_action_mask_corridors_and_diagonals() -> None:
         assert mask[7] == 0  # n
     finally:
         env.close()
+
+
+def test_is_death_or_end_screen_rogue54_tombstone() -> None:
+    lines = [" " * 80 for _ in range(24)]
+    lines[8] = "                       __________".ljust(80)
+    lines[10] = "                     /    REST    \\".ljust(80)
+    lines[11] = "                    /      IN      \\".ljust(80)
+    lines[12] = "                   /     PEACE      \\".ljust(80)
+    lines[16] = "                  |   killed by a    |".ljust(80)
+    lines[17] = "                  |      hobgoblin   |".ljust(80)
+    lines[20] = "         ________)/\\\\_//(\\/(/\\)/\\//\\/|_)_______".ljust(80)
+    lines[23] = "[Press return to continue]".ljust(80)
+    assert is_death_or_end_screen(lines) is True
+
+    score_lines = [" " * 80 for _ in range(24)]
+    score_lines[1] = "Top Ten Scores:".ljust(80)
+    assert is_death_or_end_screen(score_lines) is True
+
+
+def test_breadcrumbs_and_anti_oscillation_mask() -> None:
+    env = RogueEnv(max_steps=10)
+    try:
+        lines = [" " * 80 for _ in range(24)]
+        # Corridor '#' from (5, 4) -> (5, 5) -> (5, 6), player at (5, 5), came from (5, 4)
+        row5 = list(lines[5])
+        row5[4], row5[5], row5[6] = "#", "@", "#"
+        lines[5] = "".join(row5)
+
+        screen_arr = screen_to_array(lines)
+        env._tile_under_player = "#"
+        env._prev_pos = (5, 4)
+        env._visited_mask[4, 4] = True
+        env._visit_counts[4, 4] = 1
+        env._visited_mask[4, 5] = True
+        env._visit_counts[4, 5] = 1
+
+        obs = env._build_obs(screen_arr, (5, 5), env._status)
+        mask = obs["action_mask"]
+
+        # Visited corridor at (5, 4) is encoded as '`' (96), unvisited at (5, 6) stays '#' (35)
+        assert obs["screen"][5, 4] == ord("`")
+        assert obs["screen"][5, 6] == ord("#")
+
+        # Forward move right ('l', idx 3) is valid; backward move left ('h', idx 0) is masked
+        assert mask[3] == 1
+        assert mask[0] == 0
+
+        # Search ('s', idx 9) is valid up to 6 times at a corridor bordering blank space, then masked
+        assert mask[9] == 1
+        env._search_counts[4, 5] = 6
+        mask_after_search = env._compute_action_mask(screen_arr, (5, 5))
+        assert mask_after_search[9] == 0
+    finally:
+        env.close()
+
+
+def test_auto_eat_and_per_level_step_budget() -> None:
+    env = RogueEnv(max_steps=100)
+    try:
+        env.reset()
+        # Eating starting ration in slot 'a' should succeed, and second attempt should report no food left
+        ate_first, msgs_first = env._try_auto_eat()
+        assert ate_first is True
+        assert any("food" in m.lower() or "yum" in m.lower() or "yuk" in m.lower() for m in msgs_first)
+
+        ate_second, _ = env._try_auto_eat()
+        assert ate_second is False
+        assert env._has_food is False
+    finally:
+        env.close()
+
+
+class _FakeClient:
+    """Scripted stand-in for RoguePTYClient: one screen per key sent."""
+
+    def __init__(self, screens: dict[str, list[str]], initial: list[str]) -> None:
+        self._screens = screens
+        self._lines = initial
+        self.keys: list[str] = []
+        self.alive = True
+
+    def send_key(self, key: str) -> list[str]:
+        self.keys.append(key)
+        self._lines = self._screens.get(key, self._lines)
+        top = self._lines[0].strip()
+        return [top] if top else []
+
+    def get_lines(self) -> list[str]:
+        return list(self._lines)
+
+    def close(self) -> None:
+        self.alive = False
+
+
+def _blank_screen() -> list[str]:
+    return [" " * 80 for _ in range(24)]
+
+
+def _with(lines: list[str], row: int, col: int, text: str) -> list[str]:
+    out = list(lines)
+    out[row] = (out[row][:col] + text + out[row][col + len(text) :])[:80].ljust(80)
+    return out
+
+
+def _fake_env(screens: dict[str, list[str]], initial: list[str]) -> RogueEnv:
+    env = RogueEnv(max_steps=100)
+    env.client.close()
+    env.client = _FakeClient(screens, initial)  # type: ignore[assignment]
+    env._last_lines = initial
+    env._last_screen = screen_to_array(initial)
+    return env
+
+
+def test_inventory_overlay_is_not_an_end_screen() -> None:
+    overlay = _with(_blank_screen(), 2, 50, "--Press space to continue--")
+    assert is_death_or_end_screen(overlay) is False
+
+    winner = _with(
+        _blank_screen(), 10, 5, "Congratulations, you have made it to the light of day!"
+    )
+    winner = _with(winner, 23, 0, "--Press space to continue--")
+    assert is_death_or_end_screen(winner) is True
+
+
+def test_auto_eat_with_multiple_food_stacks_dismisses_overlay() -> None:
+    prompt = _with(_blank_screen(), 0, 0, "eat what? (* for list): ")
+    overlay = _with(_blank_screen(), 0, 50, "b) 2 rations of food")
+    overlay = _with(overlay, 1, 50, "d) A slime-mold")
+    overlay = _with(overlay, 2, 50, "--Press space to continue--")
+    eaten = _with(_blank_screen(), 0, 0, "yum, that tasted good")
+
+    env = _fake_env({"e": prompt, "*": overlay, " ": prompt, "b": eaten}, _blank_screen())
+    ate, _ = env._try_auto_eat()
+
+    assert ate is True
+    # The overlay must be dismissed with a space before the slot letter is sent.
+    assert env.client.keys == ["e", "*", " ", "b"]
+    assert env._has_food is True
+    assert is_death_or_end_screen(env.client.get_lines()) is False
+
+
+def test_auto_eat_reports_failure_when_nothing_is_eaten() -> None:
+    prompt = _with(_blank_screen(), 0, 0, "eat what? (* for list): ")
+    listing = _with(_blank_screen(), 0, 0, "a) Some food")
+    # The slot key is ignored: the prompt stays up and nothing is eaten.
+    env = _fake_env(
+        {"e": prompt, "*": listing, "a": prompt, "\x1b": _blank_screen()},
+        _blank_screen(),
+    )
+    ate, _ = env._try_auto_eat()
+
+    assert ate is False
+    assert env._has_food is False
+    assert env.client.keys[-1] == "\x1b"
+
+
+def test_food_picked_up_by_walking_re_enables_auto_eat() -> None:
+    before = _with(_blank_screen(), 5, 5, "@:")
+    after = _with(_blank_screen(), 5, 6, "@")
+    after = _with(after, 0, 0, "2 rations of food (a)")
+
+    env = _fake_env({"l": after}, before)
+    env._last_pos = (5, 5)
+    env._has_food = False
+    env.step(3)  # 'l'
+
+    assert env._has_food is True
+
+
+def test_death_step_gets_no_exploration_reward() -> None:
+    tomb = _blank_screen()
+    tomb = _with(tomb, 8, 23, "__________")
+    tomb = _with(tomb, 10, 21, "/    REST    \\")
+    tomb = _with(tomb, 12, 19, "/     PEACE      \\")
+    tomb = _with(tomb, 16, 18, "|   killed by a    |")
+
+    env = _fake_env({"h": tomb}, _blank_screen())
+    _, reward, terminated, _, _ = env.step(0)
+
+    assert terminated is True
+    assert reward == pytest.approx(-10.002)
+
+
+def test_attacking_and_resting_are_not_penalised() -> None:
+    screen = _with(_blank_screen(), 5, 5, "@K")
+    env = _fake_env({}, screen)
+    env._last_pos = (5, 5)
+    env._visited_mask[4, 5] = True
+    env._visit_counts[4, 5] = 1
+    env._seen_mask |= screen_to_array(screen)[1:23] != ord(" ")
+
+    # Repeated attacks on the monster to the right, with no hp or exp change.
+    for _ in range(6):
+        _, reward, _, _, _ = env.step(3)  # 'l'
+        assert reward == -0.002
+
+    # Resting in place does not accumulate a revisit penalty either.
+    for _ in range(6):
+        _, reward, _, _, _ = env.step(8)  # '.'
+        assert reward == -0.002
+
+    # A move into empty floor that goes nowhere is still a wasted turn.
+    _, reward, _, _, _ = env.step(0)  # 'h'
+    assert reward == pytest.approx(-0.052)
+
+
+def test_close_kills_rogue_before_closing_the_pty(monkeypatch) -> None:
+    import rogomatic_rl.pty_client as pty_client
+
+    env = RogueEnv(max_steps=10)
+    env.reset()
+    proc = env.client._proc
+    master_fd = env.client._master_fd
+    assert proc is not None and proc.poll() is None
+
+    exited_at_close: list[bool] = []
+    real_close = pty_client.os.close
+
+    def spy_close(fd: int) -> None:
+        if fd == master_fd:
+            exited_at_close.append(proc.poll() is not None)
+        real_close(fd)
+
+    monkeypatch.setattr(pty_client.os, "close", spy_close)
+    env.close()
+
+    # If the PTY master closed while Rogue was alive, Rogue would auto-save
+    # to ~/rogue.save.
+    assert exited_at_close and all(exited_at_close)

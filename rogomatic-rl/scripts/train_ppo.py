@@ -12,7 +12,7 @@ def main() -> None:
     parser.add_argument("--total-timesteps", type=int, default=100_000)
     parser.add_argument("--num-envs", type=int, default=4)
     parser.add_argument("--num-steps", type=int, default=128)
-    parser.add_argument("--max-episode-steps", type=int, default=1000)
+    parser.add_argument("--max-episode-steps", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cpu")

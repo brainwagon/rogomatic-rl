@@ -20,7 +20,7 @@ def main() -> None:
         help="Path to model checkpoint",
     )
     parser.add_argument("--episodes", type=int, default=3)
-    parser.add_argument("--max-steps", type=int, default=1000)
+    parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--delay", type=float, default=0.05)

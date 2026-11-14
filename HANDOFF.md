@@ -1,51 +1,49 @@
 # Rog-O-Matic RL Handoff
 
-## Workspace Layout
-- `/Users/markv/rogue/rogue5.4/` — Cloned from `RoguelikeRestorationProject/rogue5.4` and compiled on macOS (`arm64`) with:
-  ```sh
-  ./configure
-  make CFLAGS="-g -O2 -std=gnu89 -DNCURSES_OPAQUE=0"
-  ```
-  - Binary: `/Users/markv/rogue/rogue5.4/rogue`
-- `/Users/markv/rogue/rogomatic-rl/` — Python RL environment, recurrent PPO trainer, and tests.
-  - Virtualenv: `/Users/markv/rogue/rogomatic-rl/.venv` (`uv`, Python 3.12.13, `torch 2.15.0`, `gymnasium 1.4.0`, `pyte 0.8.2`, `numpy 2.5.4`, `pytest 9.2.0`).
+## 1. Environment & Build Status (Linux `x86_64` + CUDA)
+- **Rogue 5.4 Binary:** `/home/markv/rogomatic-rl/rogue5.4/rogue` — Rebuilt from source for `x86_64-unknown-linux-gnu` (`./configure && make CFLAGS="-g -O2 -std=gnu89 -DNCURSES_OPAQUE=0"`).
+- **Python RL Package:** `/home/markv/rogomatic-rl/rogomatic-rl/`
+  - Virtualenv: `/home/markv/rogomatic-rl/rogomatic-rl/.venv` (`uv`, Python 3.13.5, `torch 2.15.0+cu132`, `gymnasium 1.4.0`, `pyte 0.8.2`, `numpy 2.5.4`, `pytest 9.2.0`).
+  - Test suite: `.venv/bin/pytest -v` passes **9/9** tests ([test_env.py](file:///home/markv/rogomatic-rl/rogomatic-rl/tests/test_env.py), [test_model.py](file:///home/markv/rogomatic-rl/rogomatic-rl/tests/test_model.py)).
 
-## Implemented Components (`rogomatic-rl/`)
-- [pty_client.py](file:///Users/markv/rogue/rogomatic-rl/rogomatic_rl/pty_client.py) — `RoguePTYClient`: spawns `rogue5.4/rogue` in a 24×80 PTY (`TERM=vt100`, `ROGUEOPTS=terse,name=rogomatic,jump`), feeds `pyte`, auto-dismisses `--More--` prompts, and uses `step_timeout=0.02`, `idle_timeout=0.001`.
-- [parser.py](file:///Users/markv/rogue/rogomatic-rl/rogomatic_rl/parser.py) — parses row 23 status bar (`RogueStatus`), vectorized `screen_to_array` `(24, 80)`, `extract_local_crop` `(11, 11)` centered on `@`, `find_player`, and `is_death_or_end_screen`.
-- [env.py](file:///Users/markv/rogue/rogomatic-rl/rogomatic_rl/env.py) — `RogueEnv` (registered as `Rogue54-v0` in [__init__.py](file:///Users/markv/rogue/rogomatic-rl/rogomatic_rl/__init__.py)):
-  - **Observations:** `screen` `(24, 80) uint8`, `local` `(11, 11) uint8`, `stats` `(10,) float32`, `action_mask` `(12,) uint8`.
-  - **Actions (12):** `h, j, k, l, y, u, b, n, ., s, >, ,`.
-  - **Action masking:** masks out moves into `' '`/`-`/`|` walls or out-of-bounds, diagonal moves blocked by flanking walls/doorways (`diag_ok`), `>` unless `@` is on `%`, and `,` unless an uncollected item (`!?:)]/=,`) remains beneath `@`.
-  - **Rewards:** `-0.002`/step, `-0.05` wasted turn (wall bump, `"no way down"`, `"nothing here"`), `+0.02` per newly visited `(r, c)` cell, `+0.02` per newly revealed tile, `+0.05`/gold, `+0.1`/exp, `+50.0`/level, `-10.0` death.
-- [model.py](file:///Users/markv/rogue/rogomatic-rl/rogomatic_rl/model.py) — `RogueActorCritic`: global `24×80` CNN (`AdaptiveAvgPool2d((3, 10))`) + local `11×11` `stride=1` CNN + stats MLP (with registered `stats_scale` buffer) + `nn.GRU(256, 256)` + masked actor & critic heads.
-- [ppo.py](file:///Users/markv/rogue/rogomatic-rl/rogomatic_rl/ppo.py) — `PPOConfig` & `train_ppo`: recurrent PPO over `AsyncVectorEnv` (`AutoresetMode.SAME_STEP`, value bootstrapping on time-limit truncations) with trajectory-level minibatching, checkpoint saving, and `--resume` / `--resume-from` support.
-- Scripts: [run_random.py](file:///Users/markv/rogue/rogomatic-rl/scripts/run_random.py), [train_ppo.py](file:///Users/markv/rogue/rogomatic-rl/scripts/train_ppo.py), [eval_ppo.py](file:///Users/markv/rogue/rogomatic-rl/scripts/eval_ppo.py).
-- Tests: [test_env.py](file:///Users/markv/rogue/rogomatic-rl/tests/test_env.py), [test_model.py](file:///Users/markv/rogue/rogomatic-rl/tests/test_model.py).
+## 2. Key Improvements Made in This Session
+1. **Tombstone & Death Screen Detection Fix:**
+   - [parser.py](file:///home/markv/rogomatic-rl/rogomatic-rl/rogomatic_rl/parser.py#L141-L154): Fixed `is_death_or_end_screen()` to match Rogue 5.4's actual uppercase `REST` / `IN` / `PEACE` tombstone, `[Press return to continue]` prompt, `Killed by ... gold` (`notombstone`), and `Top Ten` scoreboard screens (compared against [rip.c](file:///home/markv/rogomatic-rl/rogue5.4/rip.c)).
+   - [env.py](file:///home/markv/rogomatic-rl/rogomatic-rl/rogomatic_rl/env.py#L198-L204): Forces `self._status.hp = 0` when `terminated` triggers on a cleared tombstone screen.
+2. **Breadcrumb Encoding & Anti-Oscillation Action Masking:**
+   - [env.py](file:///home/markv/rogomatic-rl/rogomatic-rl/rogomatic_rl/env.py#L406-L423): Encodes visited room floor (`.`) as `~` (`126`) and visited corridor (`#`) as `` ` `` (`96`) in `obs["screen"]` and `obs["local"]` while preserving doorways (`+`), stairs (`%`), items, and monsters.
+   - [env.py](file:///home/markv/rogomatic-rl/rogomatic-rl/rogomatic_rl/env.py#L313-L387): Masks out `.` (rest) at full HP when no monster is adjacent; restricts `s` (search) to tiles adjacent to walls/corridor dead ends with a 6-search cap per tile; prevents immediate U-turns (`self._prev_pos`) in corridors unless at a dead end; steers movement toward least-visited neighbor tiles (`self._visit_counts`) when not in combat; applies a small revisit penalty (`-0.005 * min(6, revisit_count - 2)`) for `revisit_count >= 3`.
+3. **Extended Step Budget & Automatic Ration Eating on `"Hungry"`:**
+   - [pty_client.py](file:///home/markv/rogomatic-rl/rogomatic-rl/rogomatic_rl/pty_client.py#L66): Sets `ESCDELAY=0` so `ESC` (`\x1b`) cancels prompts with zero latency.
+   - [env.py](file:///home/markv/rogomatic-rl/rogomatic-rl/rogomatic_rl/env.py#L182-L205) & `_try_auto_eat` ([env.py](file:///home/markv/rogomatic-rl/rogomatic-rl/rogomatic_rl/env.py#L278-L311)): Automatically queries the food inventory (`e` -> `*`) and eats a food ration or slime-mold (`+2.0` reward) whenever `hungry_state >= 1`.
+   - Raised default `max_episode_steps` / `--max-steps` to `2000` in [ppo.py](file:///home/markv/rogomatic-rl/rogomatic-rl/rogomatic_rl/ppo.py#L27), [train_ppo.py](file:///home/markv/rogomatic-rl/rogomatic-rl/scripts/train_ppo.py#L15), and [eval_ppo.py](file:///home/markv/rogomatic-rl/rogomatic-rl/scripts/eval_ppo.py#L23), plus a dynamic per-floor bonus of `+500 * (level - 1)` steps in [env.py](file:///home/markv/rogomatic-rl/rogomatic-rl/rogomatic_rl/env.py#L204-L205).
+4. **Interactive HTML Training Dashboard:**
+   - Generated at [training_report.html](file:///home/markv/rogomatic-rl/rogomatic-rl/training_report.html) via [generate_report.py](file:///home/markv/.gemini/antigravity-cli/brain/7fa71b42-841a-4eed-8af8-8d254ba306ff/scratch/generate_report.py) with 5 auto-scaled SVG charts (including dual-axis `best_gold`/`best_lvl` and `sps`/`pg`), phase breakdown table, and in-browser live reload from [train_8h.log](file:///home/markv/rogomatic-rl/rogomatic-rl/train_8h.log).
 
-## Current Status & Verification
-- **Tests:** `.venv/bin/pytest -v` passes (**6/6** in `2.95s`).
-- **Training throughput:** ~`180–200 sps` with `--num-envs 8` on Apple Silicon.
-- **Latest checkpoint:** saved during training at `checkpoints/rogomatic_ppo_latest.pt` (includes `model_state_dict`, `optimizer_state_dict`, `global_step`, `update`, `best_level`, `best_gold`).
+## 3. Training Progress & Active Run Status
+- **Completed 12M-step run (`update=5859/5859`):**
+  - Reached **`best_lvl=7`**, **`best_gold=535`**, peak 20-episode `mean_ret=+86.61`, and Q4 average `mean_ret=+34.91` at `636 sps`.
+- **Ongoing 24M-step run (`update=6159/11718`, `step=12,613,632+`):**
+  - Currently running in the background (`--resume --device cuda --num-envs 16 --total-timesteps 24000000`), logging to [train_8h.log](file:///home/markv/rogomatic-rl/rogomatic-rl/train_8h.log) and saving checkpoints to [rogomatic_ppo_latest.pt](file:///home/markv/rogomatic-rl/rogomatic-rl/checkpoints/rogomatic_ppo_latest.pt).
+  - Already reached **Dungeon Level 8 (`best_lvl=8`)** and **`586` gold (`best_gold=586`)**.
 
-## Useful Commands
-```sh
-cd /Users/markv/rogue/rogomatic-rl
+## 4. Useful Commands
+```bash
+cd /home/markv/rogomatic-rl/rogomatic-rl
+
+# Monitor active training log
+tail -f train_8h.log
+
+# Regenerate HTML report from latest train_8h.log
+python3 /home/markv/.gemini/antigravity-cli/brain/7fa71b42-841a-4eed-8af8-8d254ba306ff/scratch/generate_report.py
+
+# Watch latest checkpoint play (safe to run alongside training)
+.venv/bin/python scripts/eval_ppo.py --render --episodes 1 --max-steps 2000 --delay 0.05
 
 # Run test suite
 .venv/bin/pytest -v
-
-# Train PPO (500k steps, 8 parallel Rogue PTYs)
-.venv/bin/python scripts/train_ppo.py --total-timesteps 500000 --num-envs 8
-
-# Resume PPO training from latest checkpoint
-.venv/bin/python scripts/train_ppo.py --resume --total-timesteps 1000000 --num-envs 8
-
-# Watch trained agent play
-.venv/bin/python scripts/eval_ppo.py --render --episodes 1 --max-steps 300
 ```
 
-## Recommended Next Steps
-1. **Add `--resume` support** to [ppo.py](file:///Users/markv/rogue/rogomatic-rl/rogomatic_rl/ppo.py) and [train_ppo.py](file:///Users/markv/rogue/rogomatic-rl/scripts/train_ppo.py) (save `optimizer_state_dict`, `update`, and `best_level`/`best_gold` in checkpoints).
-2. **Inspect behavior with `eval_ppo.py --render`:** if the agent stalls on `.` (rest) or `s` (search), add a small penalty when `.` or `s` is used with no adjacent monster/door.
-3. **Expand action space later:** add food/potion/scroll handling (`e`, `q`, `r` + item-letter prompt handling) once the agent reliably explores levels 1–3.
+## 5. Suggested Skills for Next Session
+- `diagnose` (`/home/markv/.gemini/antigravity-cli/skills/diagnose/SKILL.md`): Use if diagnosing agent behavior bottlenecks or PTY/curses edge cases on deeper dungeon levels.
+- `tdd` (`/home/markv/.gemini/antigravity-cli/skills/tdd/SKILL.md`): Use when adding new inventory/equipment automation (e.g., auto-equipping better armor/weapons or quaffing healing potions) with unit tests in [test_env.py](file:///home/markv/rogomatic-rl/rogomatic-rl/tests/test_env.py).

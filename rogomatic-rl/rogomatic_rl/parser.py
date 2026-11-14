@@ -140,11 +140,17 @@ def find_player(lines: list[str]) -> Optional[tuple[int, int]]:
 
 def is_death_or_end_screen(lines: list[str]) -> bool:
     """Detect tombstone / scoreboard / press-return end screens."""
-    joined = "\n".join(lines)
-    if "--Press return to continue--" in joined:
+    joined_lower = "\n".join(lines).lower()
+    if "press return to continue" in joined_lower:
         return True
-    if "Rest" in joined and "Peace" in joined and "____" in joined:
+    # The winner screen.  Its "--Press space to continue--" prompt is not
+    # used as the marker, because inventory overlays show the same prompt.
+    if "made it to the light of day" in joined_lower:
         return True
-    if "Top Ten Rogues" in joined or "Top Ten Adventurers" in joined:
+    if "rest" in joined_lower and "peace" in joined_lower and "____" in joined_lower:
+        return True
+    if "killed by" in joined_lower and "gold" in joined_lower:
+        return True
+    if "top ten" in joined_lower:
         return True
     return False

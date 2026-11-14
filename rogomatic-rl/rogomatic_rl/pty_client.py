@@ -63,6 +63,7 @@ class RoguePTYClient:
         env = os.environ.copy()
         env["TERM"] = self.term
         env["ROGUEOPTS"] = self.rogue_opts
+        env["ESCDELAY"] = "0"
 
         try:
             self._proc = subprocess.Popen(
@@ -150,25 +151,26 @@ class RoguePTYClient:
     def close(self) -> None:
         """Terminate the Rogue process and release PTY/temp resources."""
         self.alive = False
+
+        # Kill Rogue before closing the PTY master, and use SIGKILL so it
+        # cannot react.  If the master closes first, Rogue's blocked read
+        # fails and it auto-saves the game to ~/rogue.save (mdport.c
+        # md_readchar), clobbering any real saved game there.
+        if self._proc is not None:
+            if self._proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+                    self._proc.wait(timeout=1.0)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            self._proc = None
+
         if self._master_fd is not None:
             try:
                 os.close(self._master_fd)
             except OSError:
                 pass
             self._master_fd = None
-
-        if self._proc is not None:
-            if self._proc.poll() is None:
-                try:
-                    os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-                    self._proc.wait(timeout=0.5)
-                except (OSError, subprocess.TimeoutExpired):
-                    try:
-                        os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
-                        self._proc.wait(timeout=0.5)
-                    except (OSError, subprocess.TimeoutExpired):
-                        pass
-            self._proc = None
 
         if self._workdir is not None:
             self._workdir.cleanup()
