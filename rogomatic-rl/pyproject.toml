@@ -1,0 +1,23 @@
+[project]
+name = "rogomatic-rl"
+version = "0.1.0"
+description = "Modern Rog-O-Matic using PyTorch, Gymnasium, and reinforcement learning on Rogue 5.4"
+requires-python = ">=3.9"
+dependencies = [
+    "gymnasium>=0.29.1",
+    "numpy>=1.26.0",
+    "pyte>=0.8.2",
+    "torch>=2.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["rogomatic_rl*"]

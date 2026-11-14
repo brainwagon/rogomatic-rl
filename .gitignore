@@ -1,0 +1,14 @@
+# Python virtual environments & caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# C object files & autotools logs
+rogue5.4/*.o
+rogue5.4/config.log
+rogue5.4/config.status
+
+# macOS
+.DS_Store
