@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import gymnasium as gym
 import numpy as np
@@ -15,6 +15,15 @@ import torch.nn as nn
 import torch.optim as optim
 
 from .env import ACTIONS
+from .episodes import (
+    EpisodeRecord,
+    EpisodeWindow,
+    append_jsonl,
+    episode_row,
+    format_summary,
+    summarize,
+)
+from .evaluate import DEFAULT_EVAL_SEED, evaluate_policy
 from .model import RogueActorCritic
 
 
@@ -42,16 +51,58 @@ class PPOConfig:
     save_interval: int = 10
     resume: bool = False
     resume_from: Optional[str] = None
+    # Shared Rogue high score file for finished games; None discards scores.
+    score_file: Optional[str] = None
+    # Rolling statistics are reported over this many recent games.
+    episode_window: int = 100
+    # JSONL file that gets one row per finished training game; None skips it.
+    episode_log: Optional[str] = None
+    # Fixed evaluation every this many updates (and at the end); 0 turns it off.
+    eval_interval: int = 0
+    eval_episodes: int = 50
+    eval_seed: int = DEFAULT_EVAL_SEED
+    eval_deterministic: bool = False
+    # JSONL file that gets one row per evaluation; None skips it.
+    eval_log: Optional[str] = None
 
 
-def _make_env(max_episode_steps: int) -> Callable[[], gym.Env]:
+def _make_env(
+    max_episode_steps: int, score_file: Optional[str] = None
+) -> Callable[[], gym.Env]:
     def _thunk() -> gym.Env:
         import rogomatic_rl  # noqa: F401 - ensure Rogue54-v0 is registered in spawned workers
 
-        env = gym.make("Rogue54-v0", max_steps=max_episode_steps)
+        env = gym.make(
+            "Rogue54-v0", max_steps=max_episode_steps, score_file=score_file
+        )
         return gym.wrappers.RecordEpisodeStatistics(env)
 
     return _thunk
+
+
+def _finished_episodes(infos: dict[str, Any]) -> list[EpisodeRecord]:
+    """Records for the games that ended on this vector-env step.
+
+    With same-step autoreset the top-level ``infos`` already describe the
+    next game; the finished game's last step is under ``final_info``.
+    """
+    final = infos.get("final_info")
+    if not isinstance(final, dict) or "episode" not in final or "level" not in final:
+        return []
+    finished = final.get("_episode")
+    if finished is None:
+        return []
+    records = []
+    for i in np.flatnonzero(finished):
+        info = {
+            key: final[key][i]
+            for key in ("level", "steps", "gold", "exp", "exp_level", "end", "killed_by")
+            if key in final
+        }
+        records.append(
+            EpisodeRecord.from_info(info, ret=float(final["episode"]["r"][i]))
+        )
+    return records
 
 
 def _save_checkpoint(path: Path, payload: dict) -> None:
@@ -74,7 +125,9 @@ def train_ppo(cfg: PPOConfig) -> Path:
     num_updates = max(1, cfg.total_timesteps // batch_size)
     envs_per_batch = max(1, cfg.num_envs // cfg.num_minibatches)
 
-    env_fns = [_make_env(cfg.max_episode_steps) for _ in range(cfg.num_envs)]
+    env_fns = [
+        _make_env(cfg.max_episode_steps, cfg.score_file) for _ in range(cfg.num_envs)
+    ]
     autoreset_mode = gym.vector.AutoresetMode.SAME_STEP
     envs = (
         gym.vector.AsyncVectorEnv(env_fns, autoreset_mode=autoreset_mode)
@@ -141,7 +194,8 @@ def train_ppo(cfg: PPOConfig) -> Path:
             },
         )
     start_time = time.time()
-    recent_returns: list[float] = []
+    eval_seconds = 0.0  # time spent in fixed evaluation, kept out of sps
+    recent = EpisodeWindow(cfg.episode_window)
 
     try:
         obs, _ = envs.reset(seed=cfg.seed)
@@ -218,10 +272,14 @@ def train_ppo(cfg: PPOConfig) -> Path:
                         best_level = max(best_level, int(np.max(info_src["level"])))
                     if "gold" in info_src:
                         best_gold = max(best_gold, int(np.max(info_src["gold"])))
-                    if "episode" in info_src and "_episode" in info_src:
-                        for i, finished in enumerate(info_src["_episode"]):
-                            if finished:
-                                recent_returns.append(float(info_src["episode"]["r"][i]))
+
+                for record in _finished_episodes(infos):
+                    recent.add(record)
+                    if cfg.episode_log:
+                        append_jsonl(
+                            cfg.episode_log,
+                            episode_row(record, update=update, global_step=global_step),
+                        )
 
             with torch.no_grad():
                 next_value = agent.get_value(
@@ -246,6 +304,9 @@ def train_ppo(cfg: PPOConfig) -> Path:
             last_pg_loss = 0.0
             last_v_loss = 0.0
             last_ent = 0.0
+            last_max_ent = 0.0
+            last_legal = 0.0
+            last_forced = 0.0
 
             for _ in range(cfg.update_epochs):
                 np.random.shuffle(env_inds)
@@ -297,23 +358,81 @@ def train_ppo(cfg: PPOConfig) -> Path:
                     last_pg_loss = float(pg_loss.item())
                     last_v_loss = float(v_loss.item())
                     last_ent = float(entropy_loss.item())
+                    # The action mask caps entropy at ln(legal actions) per
+                    # state, so report that ceiling for the same minibatch.
+                    legal = mb_masks.sum(dim=-1).clamp(min=1).float()
+                    last_max_ent = float(torch.log(legal).mean().item())
+                    last_legal = float(legal.mean().item())
+                    last_forced = float((legal == 1).float().mean().item())
 
-            sps = int((global_step - initial_global_step) / max(1e-6, time.time() - start_time))
-            mean_ret = (
-                f"{np.mean(recent_returns[-20:]):.2f}" if recent_returns else "n/a"
+            train_seconds = time.time() - start_time - eval_seconds
+            sps = int((global_step - initial_global_step) / max(1e-6, train_seconds))
+            recent_ret = recent.mean_return(last=20)
+            mean_ret = f"{recent_ret:.2f}" if recent_ret is not None else "n/a"
+            # ent_ratio near 1 means the policy is close to uniform over the
+            # legal actions; it is undefined when every state had one.
+            ent_ratio = (
+                f"{last_ent / last_max_ent:.3f}" if last_max_ent > 1e-8 else "n/a"
             )
+            # New fields go after `ent=` so existing log parsers keep working.
             print(
                 f"update={update}/{num_updates} step={global_step} sps={sps} "
                 f"mean_ret={mean_ret} best_lvl={best_level} best_gold={best_gold} "
-                f"pg={last_pg_loss:.4f} vf={last_v_loss:.4f} ent={last_ent:.3f}",
+                f"pg={last_pg_loss:.4f} vf={last_v_loss:.4f} ent={last_ent:.3f} "
+                f"ent_max={last_max_ent:.3f} ent_ratio={ent_ratio} "
+                f"legal={last_legal:.2f} forced={last_forced:.2f}",
                 flush=True,
             )
+            if len(recent):
+                print(
+                    f"episodes update={update} {format_summary(recent.summary())}",
+                    flush=True,
+                )
 
             completed_update = update
             completed_step = global_step
 
             if update % cfg.save_interval == 0 or update == num_updates:
                 save(update, global_step)
+
+            if cfg.eval_interval > 0 and (
+                update % cfg.eval_interval == 0 or update == num_updates
+            ):
+                eval_start = time.time()
+                try:
+                    summary = summarize(
+                        evaluate_policy(
+                            agent,
+                            device=device,
+                            episodes=cfg.eval_episodes,
+                            num_envs=cfg.num_envs,
+                            max_steps=cfg.max_episode_steps,
+                            seed_base=cfg.eval_seed,
+                            deterministic=cfg.eval_deterministic,
+                        )
+                    )
+                except Exception as exc:  # an evaluation must not end a long run
+                    print(f"eval update={update} failed: {exc!r}", flush=True)
+                else:
+                    print(
+                        f"eval update={update} step={global_step} "
+                        f"{format_summary(summary)}",
+                        flush=True,
+                    )
+                    if cfg.eval_log:
+                        append_jsonl(
+                            cfg.eval_log,
+                            {
+                                "source": "train",
+                                "update": update,
+                                "global_step": global_step,
+                                "seed_base": cfg.eval_seed,
+                                "deterministic": cfg.eval_deterministic,
+                                "max_steps": cfg.max_episode_steps,
+                                **summary,
+                            },
+                        )
+                eval_seconds += time.time() - eval_start
     except KeyboardInterrupt:
         # Ctrl-C or `timeout --signal=INT`: keep the work since the last
         # periodic save.  The interrupted update is recorded as not done,

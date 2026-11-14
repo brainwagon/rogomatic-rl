@@ -11,6 +11,7 @@ import struct
 import subprocess
 import tempfile
 import termios
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +19,10 @@ import pyte
 
 
 DEFAULT_ROGUE_BIN = Path(__file__).resolve().parents[2] / "rogue5.4" / "rogue"
+# Shared high score list for the agent's games (untracked; see .gitignore).
+DEFAULT_SCORE_FILE = Path(__file__).resolve().parents[1] / "scores" / "rogue.scr"
+# Name of the score file compiled into the Rogue binary, relative to its cwd.
+_SCORE_FILE_NAME = "rogue.scr"
 
 
 class RoguePTYClient:
@@ -34,6 +39,7 @@ class RoguePTYClient:
         step_timeout: float = 0.02,
         idle_timeout: float = 0.001,
         startup_timeout: float = 0.5,
+        score_file: Optional[str | Path] = None,
     ) -> None:
         self.rogue_bin = str(rogue_bin)
         self.rogue_opts = rogue_opts
@@ -41,6 +47,11 @@ class RoguePTYClient:
         self.step_timeout = step_timeout
         self.idle_timeout = idle_timeout
         self.startup_timeout = startup_timeout
+        # When set, every game shares this score file and record_score()
+        # can post to it.  When None, scores are discarded with the workdir.
+        self.score_file: Optional[Path] = (
+            Path(score_file).resolve() if score_file is not None else None
+        )
 
         self.screen = pyte.Screen(self.COLS, self.ROWS)
         self.stream = pyte.Stream(self.screen)
@@ -50,12 +61,22 @@ class RoguePTYClient:
         self._workdir: Optional[tempfile.TemporaryDirectory[str]] = None
         self.alive: bool = False
 
-    def start(self) -> list[str]:
-        """Start a fresh Rogue process and return any initial messages."""
+    def start(self, seed: Optional[int] = None) -> list[str]:
+        """Start a fresh Rogue process and return any initial messages.
+
+        With ``seed``, Rogue generates that numbered dungeon (its ``SEED``
+        environment variable) instead of a random one.  Rogue never posts
+        a seeded game to the high score list.
+        """
         self.close()
         self.screen.reset()
 
         self._workdir = tempfile.TemporaryDirectory(prefix="rogomatic_")
+        if self.score_file is not None:
+            # Rogue opens "rogue.scr" in its cwd at startup; point that at
+            # the shared file (Rogue creates the target if it is missing).
+            self.score_file.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(self.score_file, Path(self._workdir.name) / _SCORE_FILE_NAME)
         master_fd, slave_fd = pty.openpty()
         winsize = struct.pack("HHHH", self.ROWS, self.COLS, 0, 0)
         fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
@@ -64,6 +85,11 @@ class RoguePTYClient:
         env["TERM"] = self.term
         env["ROGUEOPTS"] = self.rogue_opts
         env["ESCDELAY"] = "0"
+        # Never inherit a seed from the caller's shell: an unseeded game
+        # must be random and must be able to post its score.
+        env.pop("SEED", None)
+        if seed is not None:
+            env["SEED"] = str(int(seed))
 
         try:
             self._proc = subprocess.Popen(
@@ -97,6 +123,46 @@ class RoguePTYClient:
 
         self._drain_output(first_timeout=self.step_timeout)
         return self._dismiss_more_prompts()
+
+    def record_score(self, quit_game: bool = False, timeout: float = 2.0) -> bool:
+        """Let Rogue post this game to the shared score file, then exit.
+
+        Call at the tombstone, or with ``quit_game=True`` while the player is
+        still alive to quit first (recorded as "quit").  Returns True if
+        Rogue wrote the score and exited cleanly.  Rogue only lists games
+        that beat an existing entry, so a zero-gold game is never shown.
+        """
+        if self.score_file is None or not self.alive or self._master_fd is None:
+            return False
+
+        # Rogue's own lock file does not exclude other writers, so hold a
+        # real lock across its read-modify-write of the score file.
+        lock_path = self.score_file.with_name(self.score_file.name + ".lock")
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+
+            if quit_game:
+                self.send_key("Q")
+                if "really quit" not in self.get_lines()[0].lower():
+                    return False
+                self.send_key("y")
+
+            screen_text = "\n".join(self.get_lines()).lower()
+            if "press return to continue" not in screen_text:
+                return False
+            try:
+                os.write(self._master_fd, b"\n")
+            except OSError:
+                self.alive = False
+                return False
+
+            deadline = time.monotonic() + timeout
+            while self._proc is not None and self._proc.poll() is None:
+                if time.monotonic() > deadline:
+                    return False
+                self._drain_output(first_timeout=self.step_timeout)
+            self.alive = False
+            return self._proc is not None and self._proc.returncode == 0
 
     def get_lines(self) -> list[str]:
         """Return the current 24x80 virtual screen as 24 strings of length 80."""

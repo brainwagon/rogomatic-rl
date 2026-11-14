@@ -16,10 +16,11 @@ from .parser import (
     extract_local_crop,
     find_player,
     is_death_or_end_screen,
+    parse_killer,
     parse_status,
     screen_to_array,
 )
-from .pty_client import DEFAULT_ROGUE_BIN, RoguePTYClient
+from .pty_client import DEFAULT_ROGUE_BIN, DEFAULT_SCORE_FILE, RoguePTYClient
 
 
 ACTIONS: tuple[str, ...] = (
@@ -70,11 +71,17 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         rogue_bin: str | Path = DEFAULT_ROGUE_BIN,
         max_steps: int = 2000,
         render_mode: Optional[str] = None,
+        score_file: Optional[str | Path] = None,
+        fixed_dungeons: bool = False,
     ) -> None:
         super().__init__()
         self.rogue_bin = Path(rogue_bin)
         self.max_steps = max_steps
         self.render_mode = render_mode
+        # When set, reset(seed=n) plays Rogue's dungeon number n, so the
+        # same seed gives the same dungeon (used by fixed evaluation).
+        # Off by default: training dungeons stay random.
+        self.fixed_dungeons = fixed_dungeons
 
         self.observation_space = spaces.Dict(
             {
@@ -94,7 +101,9 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         )
         self.action_space = spaces.Discrete(len(ACTIONS))
 
-        self.client = RoguePTYClient(rogue_bin=self.rogue_bin)
+        # With a score_file, finished games are posted to that shared Rogue
+        # high score list; without one, scores are discarded.
+        self.client = RoguePTYClient(rogue_bin=self.rogue_bin, score_file=score_file)
         self._steps: int = 0
         self._status: RogueStatus = RogueStatus()
         self._last_lines: list[str] = [" " * 80 for _ in range(24)]
@@ -107,6 +116,9 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._visit_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
         self._search_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
         self._has_food: bool = True
+        # How the current episode ended: None while it is running.
+        self._end: Optional[str] = None
+        self._killed_by: Optional[str] = None
 
     def reset(
         self,
@@ -123,8 +135,12 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._prev_pos = None
         self._tile_under_player = "."
         self._has_food = True
+        self._end = None
+        self._killed_by = None
 
-        messages = self.client.start()
+        messages = self.client.start(
+            seed=seed if (self.fixed_dungeons and seed is not None) else None
+        )
         lines = self.client.get_lines()
         self._last_lines = lines
 
@@ -222,6 +238,11 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             self._status = replace(self._status, hp=0)
         effective_max_steps = self.max_steps + 500 * max(0, self._status.level - 1)
         truncated = (not terminated) and (self._steps >= effective_max_steps)
+        if terminated:
+            self._end = "death"
+            self._killed_by = parse_killer(lines)
+        elif truncated:
+            self._end = "time_limit"
 
         # On a terminated step the screen is the tombstone, not the map, so
         # it must not count as newly explored tiles.
@@ -279,6 +300,12 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
 
         if self.render_mode == "human":
             self.render()
+
+        # Post the finished game to the high score list (no-op without a
+        # score file).  A time-limit episode ends with the player alive, so
+        # it quits first and is recorded as "quit".
+        if terminated or truncated:
+            self.client.record_score(quit_game=truncated)
 
         return obs, reward, terminated, truncated, info
 
@@ -515,6 +542,11 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             "hp": self._status.hp,
             "max_hp": self._status.max_hp,
             "exp": self._status.exp,
+            "exp_level": self._status.exp_level,
+            # "death" or "time_limit" on the final step, None before it.
+            "end": self._end,
+            # The killer named on the tombstone, when the game ended in death.
+            "killed_by": self._killed_by,
             "player_pos": player_pos,
             "messages": messages,
         }

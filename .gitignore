@@ -10,5 +10,11 @@ rogue5.4/*.o
 rogue5.4/config.log
 rogue5.4/config.status
 
+# Agent high score list written by training and evaluation
+rogomatic-rl/scores/
+
+# Per-episode and evaluation records written by training and evaluation
+rogomatic-rl/logs/
+
 # macOS
 .DS_Store

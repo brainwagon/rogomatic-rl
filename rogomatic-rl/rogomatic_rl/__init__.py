@@ -2,7 +2,7 @@
 
 from gymnasium.envs.registration import register
 
-from .env import ACTIONS, RogueEnv
+from .env import ACTIONS, DEFAULT_SCORE_FILE, RogueEnv
 
 register(
     id="Rogue54-v0",
@@ -10,4 +10,4 @@ register(
     nondeterministic=True,
 )
 
-__all__ = ["ACTIONS", "RogueEnv"]
+__all__ = ["ACTIONS", "DEFAULT_SCORE_FILE", "RogueEnv"]

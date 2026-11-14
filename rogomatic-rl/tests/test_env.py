@@ -8,7 +8,12 @@ import pytest
 from gymnasium.utils.env_checker import check_env
 
 from rogomatic_rl import ACTIONS, RogueEnv
-from rogomatic_rl.parser import is_death_or_end_screen, parse_status, screen_to_array
+from rogomatic_rl.parser import (
+    is_death_or_end_screen,
+    parse_killer,
+    parse_status,
+    screen_to_array,
+)
 
 
 def test_parse_status() -> None:
@@ -189,6 +194,9 @@ class _FakeClient:
     def get_lines(self) -> list[str]:
         return list(self._lines)
 
+    def record_score(self, quit_game: bool = False) -> bool:
+        return False
+
     def close(self) -> None:
         self.alive = False
 
@@ -328,3 +336,101 @@ def test_close_kills_rogue_before_closing_the_pty(monkeypatch) -> None:
     # If the PTY master closed while Rogue was alive, Rogue would auto-save
     # to ~/rogue.save.
     assert exited_at_close and all(exited_at_close)
+
+
+def test_time_limit_episode_is_posted_to_shared_score_file(tmp_path) -> None:
+    score_file = tmp_path / "scores" / "rogue.scr"
+    env = RogueEnv(max_steps=3, score_file=score_file)
+    try:
+        obs, _ = env.reset()
+        proc = env.client._proc
+        terminated = truncated = False
+        while not (terminated or truncated):
+            action = int(np.flatnonzero(obs["action_mask"])[0])
+            obs, _, terminated, truncated, _ = env.step(action)
+
+        # Rogue was allowed to write the score and exit by itself.
+        assert proc is not None and proc.returncode == 0
+        assert env.client.alive is False
+        # The shared file exists; Rogue only writes an entry for a game that
+        # beats one already listed, so a zero-gold game leaves it empty.
+        assert score_file.exists()
+    finally:
+        env.close()
+
+
+def test_no_score_file_means_no_quit_at_time_limit() -> None:
+    env = RogueEnv(max_steps=3)
+    try:
+        obs, _ = env.reset()
+        truncated = False
+        while not truncated:
+            action = int(np.flatnonzero(obs["action_mask"])[0])
+            obs, _, terminated, truncated, _ = env.step(action)
+            assert terminated is False
+        # Without a score file the game is left running, as before.
+        assert env.client.alive is True
+    finally:
+        env.close()
+
+
+def _tombstone(article: str, killer: str) -> list[str]:
+    tomb = _blank_screen()
+    tomb = _with(tomb, 8, 23, "__________")
+    tomb = _with(tomb, 10, 21, "/    REST    \\")
+    tomb = _with(tomb, 12, 19, "/     PEACE      \\")
+    tomb = _with(tomb, 16, 18, f"|   killed by {article:<2}   |")
+    tomb = _with(tomb, 17, 18, "|" + killer.center(18) + "|")
+    tomb = _with(tomb, 23, 0, "[Press return to continue]")
+    return tomb
+
+
+def test_parse_killer_reads_the_tombstone() -> None:
+    assert parse_killer(_tombstone("a", "hobgoblin")) == "hobgoblin"
+    assert parse_killer(_tombstone("an", "ice monster")) == "ice monster"
+    # Starvation has no article on the tombstone.
+    assert parse_killer(_tombstone("", "starvation")) == "starvation"
+    assert parse_killer(_blank_screen()) is None
+
+
+def test_final_step_info_says_how_the_game_ended() -> None:
+    env = _fake_env({"h": _tombstone("a", "centaur")}, _blank_screen())
+    _, _, terminated, _, info = env.step(0)
+
+    assert terminated is True
+    assert info["end"] == "death"
+    assert info["killed_by"] == "centaur"
+
+    env = _fake_env({}, _with(_blank_screen(), 5, 5, "@"))
+    env.max_steps = 2
+    _, _, _, truncated, info = env.step(8)
+    assert truncated is False
+    assert info["end"] is None
+    _, _, _, truncated, info = env.step(8)
+    assert truncated is True
+    assert info["end"] == "time_limit"
+    assert info["killed_by"] is None
+
+
+def test_fixed_dungeons_makes_reset_seed_pick_the_dungeon() -> None:
+    env = RogueEnv(max_steps=10, fixed_dungeons=True)
+    try:
+        first, _ = env.reset(seed=1000)
+        again, _ = env.reset(seed=1000)
+        other, _ = env.reset(seed=1001)
+    finally:
+        env.close()
+
+    assert np.array_equal(first["screen"], again["screen"])
+    assert not np.array_equal(first["screen"], other["screen"])
+
+
+def test_dungeons_are_random_unless_fixed_dungeons_is_set() -> None:
+    env = RogueEnv(max_steps=10)
+    try:
+        first, _ = env.reset(seed=1000)
+        again, _ = env.reset(seed=1000)
+    finally:
+        env.close()
+
+    assert not np.array_equal(first["screen"], again["screen"])

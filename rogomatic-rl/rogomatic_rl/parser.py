@@ -138,6 +138,20 @@ def find_player(lines: list[str]) -> Optional[tuple[int, int]]:
     return None
 
 
+def parse_killer(lines: list[str]) -> Optional[str]:
+    """Return what killed the player, read from the tombstone, or None.
+
+    Rogue 5.4 draws "killed by a" on one tombstone row and the killer's
+    name centred on the next (rip.c ``death``), e.g. "centaur" or
+    "starvation".  Returns None when the screen is not a tombstone.
+    """
+    for row, line in enumerate(lines[:-1]):
+        if "killed by" in line.lower():
+            killer = lines[row + 1].replace("|", " ").strip().lower()
+            return killer or None
+    return None
+
+
 def is_death_or_end_screen(lines: list[str]) -> bool:
     """Detect tombstone / scoreboard / press-return end screens."""
     joined_lower = "\n".join(lines).lower()

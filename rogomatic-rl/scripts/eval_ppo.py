@@ -1,4 +1,11 @@
-"""Evaluate or watch a trained PPO checkpoint playing Rogue 5.4."""
+"""Evaluate or watch a trained PPO checkpoint playing Rogue 5.4.
+
+Without ``--render`` this is a fixed evaluation: the policy plays a set of
+numbered dungeons (the same ones every time), and the outcome is printed
+and appended to a JSONL file so checkpoints can be compared.
+
+With ``--render`` it plays one game at a time on screen.
+"""
 
 from __future__ import annotations
 
@@ -7,36 +14,42 @@ import time
 
 import torch
 
-from rogomatic_rl import ACTIONS, RogueEnv
+from rogomatic_rl import ACTIONS, DEFAULT_SCORE_FILE, RogueEnv
+from rogomatic_rl.episodes import (
+    EpisodeRecord,
+    append_jsonl,
+    format_summary,
+    summarize,
+)
+from rogomatic_rl.evaluate import DEFAULT_EVAL_SEED, evaluate_policy
 from rogomatic_rl.model import RogueActorCritic
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a trained Rogue PPO agent.")
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default="checkpoints/rogomatic_ppo_latest.pt",
-        help="Path to model checkpoint",
+def _describe(ep: int, record: EpisodeRecord) -> str:
+    ending = record.end
+    if record.killed_by:
+        ending += f" ({record.killed_by})"
+    dungeon = f" dungeon={record.seed}" if record.seed is not None else ""
+    return (
+        f"Episode {ep}:{dungeon} steps={record.steps} level={record.level} "
+        f"gold={record.gold} exp={record.exp_level}/{record.exp} "
+        f"reward={record.ret:.2f} end={ending}"
     )
-    parser.add_argument("--episodes", type=int, default=3)
-    parser.add_argument("--max-steps", type=int, default=2000)
-    parser.add_argument("--deterministic", action="store_true")
-    parser.add_argument("--render", action="store_true")
-    parser.add_argument("--delay", type=float, default=0.05)
-    args = parser.parse_args()
 
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    agent = RogueActorCritic(num_actions=len(ACTIONS))
-    agent.load_state_dict(ckpt["model_state_dict"])
-    agent.eval()
 
-    render_mode = "human" if args.render else None
-    env = RogueEnv(max_steps=args.max_steps, render_mode=render_mode)
-
+def _watch(agent: RogueActorCritic, args: argparse.Namespace) -> list[EpisodeRecord]:
+    """Play games one at a time on screen."""
+    env = RogueEnv(
+        max_steps=args.max_steps,
+        render_mode="human",
+        score_file=None if args.no_score_file else args.score_file,
+        fixed_dungeons=args.seed is not None,
+    )
+    records = []
     try:
-        for ep in range(1, args.episodes + 1):
-            obs, info = env.reset()
+        for ep in range(args.episodes):
+            seed = args.seed + ep if args.seed is not None else None
+            obs, info = env.reset(seed=seed)
             hx = torch.zeros((1, 1, agent.hidden_dim), dtype=torch.float32)
             total_reward = 0.0
             terminated = False
@@ -58,18 +71,113 @@ def main() -> None:
                     )
                 obs, reward, terminated, truncated, info = env.step(int(action.item()))
                 total_reward += reward
-                if args.render and args.delay > 0:
+                if args.delay > 0:
                     time.sleep(args.delay)
 
-            print(
-                f"Episode {ep}: steps={info['steps']} "
-                f"level={info['level']} gold={info['gold']} "
-                f"hp={info['hp']}/{info['max_hp']} exp={info['exp']} "
-                f"reward={total_reward:.2f} "
-                f"terminated={terminated} truncated={truncated}"
-            )
+            records.append(EpisodeRecord.from_info(info, ret=total_reward, seed=seed))
+            print(_describe(ep + 1, records[-1]))
     finally:
         env.close()
+    return records
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Evaluate a trained Rogue PPO agent.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="checkpoints/rogomatic_ppo_latest.pt",
+        help="Path to model checkpoint",
+    )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=None,
+        help="Games to play (default: 50, or 3 with --render)",
+    )
+    parser.add_argument("--max-steps", type=int, default=2000)
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "First dungeon number; game k plays dungeon seed+k "
+            f"(default: {DEFAULT_EVAL_SEED}, or random dungeons with --render)"
+        ),
+    )
+    parser.add_argument(
+        "--num-envs", type=int, default=8, help="Games played in parallel"
+    )
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--out",
+        type=str,
+        default="logs/evals.jsonl",
+        help="JSONL file that gets one row per evaluation",
+    )
+    parser.add_argument(
+        "--no-out", action="store_true", help="Do not write the evaluation row"
+    )
+    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--delay", type=float, default=0.05)
+    parser.add_argument(
+        "--score-file",
+        type=str,
+        default=str(DEFAULT_SCORE_FILE),
+        help="Rogue high score file for --render games on random dungeons",
+    )
+    parser.add_argument(
+        "--no-score-file",
+        action="store_true",
+        help="Do not record --render games in the high score list",
+    )
+    args = parser.parse_args()
+
+    ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=True)
+    agent = RogueActorCritic(num_actions=len(ACTIONS)).to(args.device)
+    agent.load_state_dict(ckpt["model_state_dict"])
+    agent.eval()
+
+    if args.render:
+        args.episodes = 3 if args.episodes is None else args.episodes
+        agent.to("cpu")
+        _watch(agent, args)
+        return
+
+    episodes = 50 if args.episodes is None else args.episodes
+    seed_base = DEFAULT_EVAL_SEED if args.seed is None else args.seed
+    records = evaluate_policy(
+        agent,
+        device=args.device,
+        episodes=episodes,
+        num_envs=args.num_envs,
+        max_steps=args.max_steps,
+        seed_base=seed_base,
+        deterministic=args.deterministic,
+    )
+    for ep, record in enumerate(records, start=1):
+        print(_describe(ep, record))
+    summary = summarize(records)
+    print(f"eval {format_summary(summary)}")
+    if summary.get("killers"):
+        print(f"killers {summary['killers']}")
+
+    if not args.no_out:
+        append_jsonl(
+            args.out,
+            {
+                "source": "eval_ppo",
+                "checkpoint": args.checkpoint,
+                "update": ckpt.get("update"),
+                "global_step": ckpt.get("global_step"),
+                "seed_base": seed_base,
+                "deterministic": args.deterministic,
+                "max_steps": args.max_steps,
+                **summary,
+            },
+        )
+        print(f"Appended evaluation to {args.out}")
 
 
 if __name__ == "__main__":
