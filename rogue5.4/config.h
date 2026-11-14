@@ -81,7 +81,7 @@
 /* #undef HAVE_NLIST */
 
 /* Define to 1 if you have the <nlist.h> header file. */
-#define HAVE_NLIST_H 1
+/* #undef HAVE_NLIST_H */
 
 /* Define to 1 if you have the <process.h> header file. */
 /* #undef HAVE_PROCESS_H */
@@ -99,10 +99,10 @@
 #define HAVE_SETREGID 1
 
 /* Define to 1 if you have the `setresgid' function. */
-/* #undef HAVE_SETRESGID */
+#define HAVE_SETRESGID 1
 
 /* Define to 1 if you have the `setresuid' function. */
-/* #undef HAVE_SETRESUID */
+#define HAVE_SETRESUID 1
 
 /* Define to 1 if you have the `setreuid' function. */
 #define HAVE_SETREUID 1

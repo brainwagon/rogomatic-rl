@@ -35,16 +35,16 @@ LIBS =	 -lcurses
 RM    = rm -f
 
 #GROFF=groff
-GROFF = 
+GROFF = groff
 
 #NROFF=nroff
-NROFF = 
+NROFF = nroff
 
 #TBL=tbl
-TBL   = 
+TBL   = tbl
 
 #COLCRT=colcrt
-COLCRT = 
+COLCRT = colcrt
 
 #SED=sed
 SED   = sed
@@ -62,7 +62,7 @@ GROUPOWNER =
 CPPFLAGS =-DHAVE_CONFIG_H 
 
 #DISTFILE = $(PROGRAM)
-DISTFILE = $(DISTNAME)-arm-apple-darwin25.6.0
+DISTFILE = $(DISTNAME)-x86_64-unknown-linux-gnu
 
 INSTALL=./install-sh
 
