@@ -51,6 +51,16 @@ class PPOConfig:
     save_interval: int = 10
     resume: bool = False
     resume_from: Optional[str] = None
+    # Start a new run (step 0, fresh optimizer and learning-rate schedule)
+    # from this checkpoint's network weights.  Unlike resume, nothing else
+    # is carried over.  Use it after a change to the rewards.
+    init_from: Optional[str] = None
+    # With init_from: re-initialise the value head, whose outputs are on
+    # the old reward scale.
+    reset_critic: bool = False
+    # Divide rewards by a running estimate of the spread of the discounted
+    # return, so the value targets stay near unit scale.
+    normalize_reward: bool = True
     # Shared Rogue high score file for finished games; None discards scores.
     score_file: Optional[str] = None
     # Rolling statistics are reported over this many recent games.
@@ -78,6 +88,58 @@ def _make_env(
         return gym.wrappers.RecordEpisodeStatistics(env)
 
     return _thunk
+
+
+class RewardScaler:
+    """Scales rewards by the running standard deviation of the discounted return.
+
+    The same scheme as gymnasium's ``NormalizeReward``: rewards are divided
+    (not centred), so their sign and relative size are kept.  The statistics
+    are part of the checkpoint, because the value head is trained on the
+    scaled rewards.
+    """
+
+    def __init__(
+        self, num_envs: int, gamma: float, clip: float = 10.0, eps: float = 1e-8
+    ) -> None:
+        self.gamma = gamma
+        self.clip = clip
+        self.eps = eps
+        self.returns = np.zeros(num_envs, dtype=np.float64)
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = 1e-4
+
+    @property
+    def scale(self) -> float:
+        """The current divisor."""
+        return float(np.sqrt(self.var + self.eps))
+
+    def __call__(self, reward: np.ndarray, done: np.ndarray) -> np.ndarray:
+        """Update the statistics with one vector-env step and scale its rewards."""
+        self.returns = self.returns * self.gamma + reward
+        batch_mean = float(self.returns.mean())
+        batch_var = float(self.returns.var())
+        batch_count = self.returns.size
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        self.var = (
+            self.var * self.count
+            + batch_var * batch_count
+            + delta**2 * self.count * batch_count / total
+        ) / total
+        self.mean += delta * batch_count / total
+        self.count = total
+        self.returns[done] = 0.0
+        return np.clip(reward / self.scale, -self.clip, self.clip)
+
+    def state_dict(self) -> dict[str, float]:
+        return {"mean": self.mean, "var": self.var, "count": self.count}
+
+    def load_state_dict(self, state: dict[str, float]) -> None:
+        self.mean = float(state["mean"])
+        self.var = float(state["var"])
+        self.count = float(state["count"])
 
 
 def _finished_episodes(infos: dict[str, Any]) -> list[EpisodeRecord]:
@@ -117,6 +179,8 @@ def _save_checkpoint(path: Path, payload: dict) -> None:
 
 def train_ppo(cfg: PPOConfig) -> Path:
     """Train a recurrent RogueActorCritic agent with PPO."""
+    if cfg.init_from and (cfg.resume or cfg.resume_from):
+        raise ValueError("init_from starts a new run; do not combine it with resume")
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
@@ -157,7 +221,17 @@ def train_ppo(cfg: PPOConfig) -> Path:
     best_level = 1
     best_gold = 0
 
-    if cfg.resume or cfg.resume_from:
+    reward_scaler = (
+        RewardScaler(cfg.num_envs, cfg.gamma) if cfg.normalize_reward else None
+    )
+
+    if cfg.init_from:
+        ckpt = torch.load(cfg.init_from, map_location=device, weights_only=True)
+        agent.load_state_dict(ckpt["model_state_dict"])
+        if cfg.reset_critic:
+            nn.init.orthogonal_(agent.critic.weight, 1.0)
+            nn.init.constant_(agent.critic.bias, 0.0)
+    elif cfg.resume or cfg.resume_from:
         resume_path = Path(cfg.resume_from) if cfg.resume_from else latest_ckpt
         if resume_path.exists():
             ckpt = torch.load(resume_path, map_location=device, weights_only=True)
@@ -168,6 +242,10 @@ def train_ppo(cfg: PPOConfig) -> Path:
             start_update = int(ckpt.get("update", global_step // batch_size)) + 1
             best_level = int(ckpt.get("best_level", 1))
             best_gold = int(ckpt.get("best_gold", 0))
+            # A checkpoint from before reward scaling has no statistics; the
+            # scaler then starts fresh and the value head has to re-adapt.
+            if reward_scaler is not None and "reward_scaler" in ckpt:
+                reward_scaler.load_state_dict(ckpt["reward_scaler"])
             if global_step < cfg.total_timesteps:
                 num_updates = max(start_update, cfg.total_timesteps // batch_size)
             else:
@@ -191,6 +269,11 @@ def train_ppo(cfg: PPOConfig) -> Path:
                 "update": update_num,
                 "best_level": best_level,
                 "best_gold": best_gold,
+                **(
+                    {"reward_scaler": reward_scaler.state_dict()}
+                    if reward_scaler is not None
+                    else {}
+                ),
             },
         )
     start_time = time.time()
@@ -236,6 +319,10 @@ def train_ppo(cfg: PPOConfig) -> Path:
 
                 obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
                 done = np.logical_or(terminated, truncated)
+                # Scale before the truncation bootstrap below, which adds a
+                # value estimate that is already on the scaled reward scale.
+                if reward_scaler is not None:
+                    reward = reward_scaler(reward, done)
                 rewards[step] = torch.as_tensor(reward, dtype=torch.float32, device=device)
 
                 # Bootstrap value on time-limit truncations (where episode did not terminate by death)
@@ -380,7 +467,8 @@ def train_ppo(cfg: PPOConfig) -> Path:
                 f"mean_ret={mean_ret} best_lvl={best_level} best_gold={best_gold} "
                 f"pg={last_pg_loss:.4f} vf={last_v_loss:.4f} ent={last_ent:.3f} "
                 f"ent_max={last_max_ent:.3f} ent_ratio={ent_ratio} "
-                f"legal={last_legal:.2f} forced={last_forced:.2f}",
+                f"legal={last_legal:.2f} forced={last_forced:.2f}"
+                + (f" rscale={reward_scaler.scale:.2f}" if reward_scaler else ""),
                 flush=True,
             )
             if len(recent):

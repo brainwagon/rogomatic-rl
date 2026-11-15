@@ -52,6 +52,19 @@ _MOVE_DELTAS: tuple[tuple[int, int], ...] = (
 _WALL_CHARS = frozenset({" ", "-", "|"})
 _ITEM_CHARS = frozenset({"!", "?", ":", ")", "]", "/", "=", ","})
 
+# Reward terms.  A descent and a death are the same size, so reaching the
+# next level is not worth dying for, and every term is within about three
+# orders of magnitude of the per-step ones (a descent used to be +50).
+REWARD_DESCENT = 10.0  # per dungeon level gained
+REWARD_DEATH = -10.0
+# Health shaping: the reward tracks the change in hp / max_hp, so going
+# from full health to none costs this much and healing earns it back.
+# Being a pure difference, it cannot be farmed by getting hurt and resting.
+REWARD_HEALTH = 5.0
+REWARD_EXP_POINT = 0.2  # per experience point gained ...
+REWARD_EXP_STEP_CAP = 5.0  # ... up to this much on one step
+REWARD_EXP_LEVEL = 3.0  # per experience level gained
+
 # Prompt at the bottom of Rogue's multi-line inventory overlay (things.c).
 _OVERLAY_PROMPT = "--Press space to continue--"
 # Pack-add message for food, e.g. "2 rations of food (a)", "a slime-mold (c)".
@@ -522,11 +535,18 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         if ate_food:
             reward += 2.0
         reward += 0.05 * max(0, curr.gold - prev.gold)
-        reward += 0.1 * max(0, curr.exp - prev.exp)
-        reward += 50.0 * max(0, curr.level - prev.level)
+        reward += min(
+            REWARD_EXP_STEP_CAP, REWARD_EXP_POINT * max(0, curr.exp - prev.exp)
+        )
+        reward += REWARD_EXP_LEVEL * max(0, curr.exp_level - prev.exp_level)
+        reward += REWARD_DESCENT * max(0, curr.level - prev.level)
         reward += 0.02 * new_tiles
+        # On death hp has been set to 0, so the remaining health is lost here.
+        reward += REWARD_HEALTH * (
+            curr.hp / max(1, curr.max_hp) - prev.hp / max(1, prev.max_hp)
+        )
         if terminated:
-            reward -= 10.0
+            reward += REWARD_DEATH
         return float(reward)
 
     def _build_obs(

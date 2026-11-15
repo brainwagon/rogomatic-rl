@@ -8,6 +8,15 @@ import pytest
 from gymnasium.utils.env_checker import check_env
 
 from rogomatic_rl import ACTIONS, RogueEnv
+from rogomatic_rl.env import (
+    REWARD_DEATH,
+    REWARD_DESCENT,
+    REWARD_EXP_LEVEL,
+    REWARD_EXP_POINT,
+    REWARD_EXP_STEP_CAP,
+    REWARD_HEALTH,
+)
+from rogomatic_rl.parser import RogueStatus
 from rogomatic_rl.parser import (
     is_death_or_end_screen,
     parse_killer,
@@ -287,7 +296,8 @@ def test_death_step_gets_no_exploration_reward() -> None:
     _, reward, terminated, _, _ = env.step(0)
 
     assert terminated is True
-    assert reward == pytest.approx(-10.002)
+    # Step penalty, death, and the loss of all remaining health (it was full).
+    assert reward == pytest.approx(-0.002 + REWARD_DEATH - REWARD_HEALTH)
 
 
 def test_attacking_and_resting_are_not_penalised() -> None:
@@ -485,3 +495,47 @@ def test_mask_is_unchanged_with_no_monster_adjacent() -> None:
     mask = _mask_at(lines, (5, 5))
 
     assert int(mask[:8].sum()) == 8  # every direction is open floor
+
+
+def _reward(prev: RogueStatus, curr: RogueStatus, terminated: bool = False) -> float:
+    """The reward for a step with no exploration, minus the step penalty."""
+    return RogueEnv._compute_reward(prev, curr, 0, False, False, terminated) + 0.002
+
+
+def test_a_descent_is_worth_no_more_than_a_death() -> None:
+    start = RogueStatus(level=1)
+
+    assert _reward(start, RogueStatus(level=2)) == pytest.approx(REWARD_DESCENT)
+    assert REWARD_DESCENT <= -REWARD_DEATH
+
+
+def test_health_lost_is_charged_and_health_regained_is_paid_back() -> None:
+    full = RogueStatus(hp=12, max_hp=12)
+    hurt = RogueStatus(hp=3, max_hp=12)
+
+    assert _reward(full, hurt) == pytest.approx(-0.75 * REWARD_HEALTH)
+    # Getting hurt and healing back nets to nothing, so it cannot be farmed.
+    assert _reward(full, hurt) + _reward(hurt, full) == pytest.approx(0.0)
+
+
+def test_dying_costs_the_remaining_health_as_well_as_the_death_penalty() -> None:
+    hurt = RogueStatus(hp=3, max_hp=12)
+    dead = RogueStatus(hp=0, max_hp=12)
+
+    assert _reward(hurt, dead, terminated=True) == pytest.approx(
+        REWARD_DEATH - 0.25 * REWARD_HEALTH
+    )
+
+
+def test_experience_is_rewarded_per_point_up_to_a_cap_and_per_level() -> None:
+    start = RogueStatus(exp=0, exp_level=1)
+
+    # A hobgoblin is worth 3 points.
+    assert _reward(start, RogueStatus(exp=3)) == pytest.approx(3 * REWARD_EXP_POINT)
+    # One huge kill is capped, so deep monsters do not swamp everything else.
+    assert _reward(start, RogueStatus(exp=500)) == pytest.approx(REWARD_EXP_STEP_CAP)
+    assert _reward(start, RogueStatus(exp=10, exp_level=2)) == pytest.approx(
+        10 * REWARD_EXP_POINT + REWARD_EXP_LEVEL
+    )
+    # Losing a level (a wraith's drain) is not rewarded or charged here.
+    assert _reward(RogueStatus(exp=10, exp_level=2), start) == pytest.approx(0.0)

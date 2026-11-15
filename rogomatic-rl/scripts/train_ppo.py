@@ -32,6 +32,25 @@ def main() -> None:
         help="Optional explicit checkpoint path to resume from",
     )
     parser.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        help=(
+            "Start a new run (step 0, fresh optimizer and learning-rate "
+            "schedule) from this checkpoint's network weights"
+        ),
+    )
+    parser.add_argument(
+        "--reset-critic",
+        action="store_true",
+        help="With --init-from: re-initialise the value head",
+    )
+    parser.add_argument(
+        "--no-normalize-reward",
+        action="store_true",
+        help="Train on raw rewards instead of scaling them by the return's spread",
+    )
+    parser.add_argument(
         "--score-file",
         type=str,
         default=str(DEFAULT_SCORE_FILE),
@@ -91,6 +110,9 @@ def main() -> None:
         save_interval=args.save_interval,
         resume=args.resume,
         resume_from=args.resume_from,
+        init_from=args.init_from,
+        reset_critic=args.reset_critic,
+        normalize_reward=not args.no_normalize_reward,
         score_file=None if args.no_score_file else args.score_file,
         episode_log=None if args.no_episode_log else args.episode_log,
         eval_interval=args.eval_interval,

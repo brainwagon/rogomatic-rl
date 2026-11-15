@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from rogomatic_rl import ACTIONS
@@ -103,3 +104,84 @@ def test_interrupted_training_saves_completed_progress(tmp_path: Path, monkeypat
     assert ckpt["global_step"] == 32
     # The atomic write leaves no temp file behind.
     assert [p.name for p in tmp_path.iterdir()] == [ckpt_path.name]
+
+
+def test_reward_scaler_brings_large_rewards_to_unit_scale() -> None:
+    import numpy as np
+
+    from rogomatic_rl.ppo import RewardScaler
+
+    scaler = RewardScaler(num_envs=4, gamma=0.99)
+    rng = np.random.default_rng(0)
+    done = np.zeros(4, dtype=bool)
+    for _ in range(2000):
+        # Mostly tiny rewards with an occasional large one, like a descent.
+        reward = np.where(rng.random(4) < 0.01, 10.0, -0.002)
+        scaled = scaler(reward, done)
+
+    assert scaler.scale > 1.0
+    # Sign and relative size are kept: rewards are divided, not centred.
+    assert scaler(np.full(4, -0.002), done)[0] < 0
+    assert abs(scaled).max() <= 10.0
+    assert scaler(np.full(4, 10.0), done)[0] == pytest.approx(10.0 / scaler.scale, rel=0.05)
+
+    # The statistics survive a save and load.
+    restored = RewardScaler(num_envs=4, gamma=0.99)
+    restored.load_state_dict(scaler.state_dict())
+    assert restored.scale == pytest.approx(scaler.scale)
+
+
+def test_reward_scaler_forgets_the_return_of_a_finished_game() -> None:
+    import numpy as np
+
+    from rogomatic_rl.ppo import RewardScaler
+
+    scaler = RewardScaler(num_envs=2, gamma=0.99)
+    scaler(np.array([5.0, 5.0]), np.array([True, False]))
+
+    assert scaler.returns[0] == 0.0
+    assert scaler.returns[1] == 5.0
+
+
+def test_init_from_starts_a_new_run_from_old_weights(tmp_path: Path) -> None:
+    common = dict(
+        num_envs=2, num_steps=16, max_episode_steps=50, update_epochs=1, num_minibatches=2
+    )
+    old_dir, new_dir = tmp_path / "old", tmp_path / "new"
+    old_ckpt_path = train_ppo(
+        PPOConfig(total_timesteps=64, checkpoint_dir=str(old_dir), **common)
+    )
+    old = torch.load(old_ckpt_path, map_location="cpu", weights_only=True)
+    assert old["update"] == 2
+    assert "reward_scaler" in old
+
+    # No learning (lr 0), so the new run's weights show what was loaded.
+    new_ckpt_path = train_ppo(
+        PPOConfig(
+            total_timesteps=32,
+            checkpoint_dir=str(new_dir),
+            init_from=str(old_ckpt_path),
+            reset_critic=True,
+            learning_rate=0.0,
+            **common,
+        )
+    )
+    new = torch.load(new_ckpt_path, map_location="cpu", weights_only=True)
+
+    # A new run: the step and update counts start again.
+    assert new["update"] == 1
+    assert new["global_step"] == 32
+    old_w, new_w = old["model_state_dict"], new["model_state_dict"]
+    assert torch.equal(old_w["actor.weight"], new_w["actor.weight"])
+    assert torch.equal(old_w["gru.weight_hh_l0"], new_w["gru.weight_hh_l0"])
+    # Only the value head was re-initialised.
+    assert not torch.equal(old_w["critic.weight"], new_w["critic.weight"])
+
+
+def test_init_from_cannot_be_combined_with_resume(tmp_path: Path) -> None:
+    cfg = PPOConfig(
+        total_timesteps=32, num_envs=2, num_steps=16, checkpoint_dir=str(tmp_path),
+        init_from="anything.pt", resume=True,
+    )
+    with pytest.raises(ValueError, match="init_from"):
+        train_ppo(cfg)
