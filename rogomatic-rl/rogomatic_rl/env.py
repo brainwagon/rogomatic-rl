@@ -116,6 +116,42 @@ _UNKNOWN_POTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_KNOWN_SCROLL_RE = re.compile(r"^(?:an?|(\d+))\s+scrolls?\s+of\s+(.+?)\s*$", re.IGNORECASE)
+_TITLED_SCROLL_RE = re.compile(
+    r"^(?:an?|(\d+))\s+scrolls?\s+titled\s+'(.*)'\s*$", re.IGNORECASE
+)
+_CALLED_SCROLL_RE = re.compile(
+    r"^(?:an?|(\d+))\s+scrolls?\s+called\s+(.+?)\s*$", re.IGNORECASE
+)
+# Printed by read_scroll for every identify scroll before the prompt (scrolls.c).
+_IDENTIFY_MSG_RE = re.compile(r"this scroll is an (identify [a-z ,]+?) scroll")
+# Known scrolls read as soon as no monster is in view.
+_SCROLLS_READ_WHEN_SAFE = frozenset(
+    {
+        "enchant armor",
+        "enchant weapon",
+        "protect armor",
+        "magic mapping",
+        "monster confusion",
+    }
+)
+# Known scrolls read only to escape a fight, in this order.
+_SCROLLS_FOR_ESCAPE = ("teleportation", "hold monster")
+# Scroll effects whose reading leaves oi_know false, so the env infers the
+# kind from the message Rogue prints (scrolls.c).
+_SCROLL_EFFECT_MESSAGES: tuple[tuple[str, str], ...] = (
+    ("your armor glows", "enchant armor"),
+    ("shimmering", "protect armor"),
+    ("universal oneness", "remove curse"),
+    ("somebody is watching over you", "remove curse"),
+    ("maniacal laughter", "scare monster"),
+    ("your hands begin to glow", "monster confusion"),
+)
+_WEAPON_GLOWS_RE = re.compile(r"your .+ glows blue")
+# Upper bound on keys sent at one `identify what?` prompt. Rogue loops on ESC
+# there, so the env keeps offering items until one is accepted.
+_MAX_IDENTIFY_KEYS = 30
+
 _KNOWN_RING_RE = re.compile(
     r"^(?:an?|(\d+))\s+rings?\s+of\s+([a-z ]+?)(?:\s+\[([+-]?\d+)\])?\(([a-z ]+)\)$",
     re.IGNORECASE,
@@ -233,6 +269,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._known_ring_stones: dict[str, tuple[str, Optional[int]]] = {}
         self._tried_potion_colors: set[str] = set()
         self._known_potion_colors: dict[str, str] = {}
+        self._tried_scroll_keys: set[str] = set()
+        self._known_scroll_titles: dict[str, str] = {}
         # How the current episode ended: None while it is running.
         self._end: Optional[str] = None
         self._killed_by: Optional[str] = None
@@ -262,6 +300,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._known_ring_stones = {}
         self._tried_potion_colors = set()
         self._known_potion_colors = {}
+        self._tried_scroll_keys = set()
+        self._known_scroll_titles = {}
         self._end = None
         self._killed_by = None
 
@@ -709,6 +749,211 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 return self._quaff_slot(slot, count, color)
         return []
 
+    def _parse_scroll(self, desc: str) -> Optional[tuple[int, Optional[str], str]]:
+        """Parse a scroll pack entry into (count, kind_or_None, key), or None.
+
+        `key` names the scroll's title (or its user-given name) so repeated
+        copies of an unidentified scroll are recognised as the same kind.
+        """
+        clean = desc.strip()
+        match = _KNOWN_SCROLL_RE.match(clean)
+        if match:
+            kind = match.group(2).strip().lower()
+            return (int(match.group(1)) if match.group(1) else 1, kind, f"of:{kind}")
+        match = _TITLED_SCROLL_RE.match(clean)
+        if match:
+            key = f"titled:{match.group(2).strip().lower()}"
+        else:
+            match = _CALLED_SCROLL_RE.match(clean)
+            if not match:
+                return None
+            key = f"called:{match.group(2).strip().lower()}"
+        count = int(match.group(1)) if match.group(1) else 1
+        return count, self._known_scroll_titles.get(key), key
+
+    def _identify_class(self, desc: str) -> Optional[tuple[str, bool]]:
+        """Classify a pack item for an identify scroll: (scroll name, unidentified)."""
+        clean = desc.strip()
+        potion = self._parse_potion(clean)
+        if potion is not None:
+            return "identify potion", potion[1] is None
+        scroll = self._parse_scroll(clean)
+        if scroll is not None:
+            return "identify scroll", scroll[1] is None
+        ring = self._ring_value(clean)
+        if ring is not None:
+            return "identify ring, wand or staff", ring[0] == "unknown"
+        if re.search(r"\b(?:wand|staff)\b", clean, re.IGNORECASE):
+            return "identify ring, wand or staff", " of " not in clean
+        if (
+            self._weapon_value(clean) is not None
+            or self._missile_value(clean) is not None
+        ):
+            return "identify weapon", re.search(r"[+-]\d+,[+-]\d+", clean) is None
+        if self._armor_value(clean) is not None:
+            return "identify armor", re.match(r"^[+-]\d+\s", clean) is None
+        return None
+
+    def _identify_candidates(
+        self, kind: Optional[str], read_slot: str, read_count: int
+    ) -> tuple[list[str], list[str]]:
+        """Pack slots to offer an identify scroll: (unidentified, already known)."""
+        preferred: list[str] = []
+        fallback: list[str] = []
+        for slot, desc in sorted(self._pack.items()):
+            if slot == read_slot and read_count <= 1:
+                continue  # the scroll being read has already left the pack
+            cls = self._identify_class(desc)
+            if cls is None or (kind is not None and cls[0] != kind):
+                continue
+            (preferred if cls[1] else fallback).append(slot)
+        return preferred, fallback
+
+    @staticmethod
+    def _infer_scroll_kind(text: str) -> Optional[str]:
+        """Guess a scroll kind from its reading message (for kinds Rogue leaves unnamed)."""
+        for fragment, kind in _SCROLL_EFFECT_MESSAGES:
+            if fragment in text:
+                return kind
+        if _WEAPON_GLOWS_RE.search(text):
+            return "enchant weapon"
+        return None
+
+    def _scroll_prompts(
+        self, identify_kind: Optional[str], read_slot: str, read_count: int
+    ) -> list[str]:
+        """Answer the prompts a scroll can leave behind, so the game is back at its command prompt.
+
+        Rogue re-asks `identify what?` after ESC (wizard.c, whatis with
+        insist), so that prompt is answered with a real item; `*` is the
+        only way out when the pack holds nothing of the asked type.
+        """
+        collected: list[str] = []
+        queue: Optional[list[str]] = None
+        for _ in range(_MAX_IDENTIFY_KEYS):
+            top = self.client.get_lines()[0].lower()
+            if "identify what" in top:
+                if queue is None:
+                    preferred, fallback = self._identify_candidates(
+                        identify_kind, read_slot, read_count
+                    )
+                    chosen = preferred + fallback
+                    rest = [s for s in sorted(self._pack) if s not in chosen]
+                    queue = chosen + ["*"] + rest
+                if not queue:
+                    break
+                collected.extend(self.client.send_key(queue.pop(0)))
+                collected.extend(self._dismiss_overlay())
+            elif "call it" in top or "read what" in top:
+                collected.extend(self.client.send_key("\x1b"))
+            else:
+                break
+        return collected
+
+    def _read_scroll_slot(
+        self, slot: str, desc: str, count: int, kind: Optional[str], key: str
+    ) -> list[str]:
+        """Read one scroll from `slot` and keep the pack and curse flags in step."""
+        collected: list[str] = []
+        collected.extend(self.client.send_key("r"))
+        read_msgs = self.client.send_key(slot)
+        collected.extend(read_msgs)
+        self._tried_scroll_keys.add(key)
+
+        text = " ".join(read_msgs).lower()
+        identify_match = _IDENTIFY_MSG_RE.search(text)
+        identify_kind = identify_match.group(1) if identify_match else None
+        if kind is not None and kind.startswith("identify"):
+            identify_kind = kind
+        inferred = self._infer_scroll_kind(text)
+        if kind is None and inferred is not None:
+            self._known_scroll_titles[key] = inferred
+        effect = kind or inferred
+        collected.extend(self._scroll_prompts(identify_kind, slot, count))
+
+        if effect == "remove curse":
+            self._armor_cursed = False
+            self._weapon_cursed = False
+            self._ring_cursed = {"left": False, "right": False}
+        elif effect in ("enchant armor", "protect armor"):
+            self._armor_cursed = False
+        elif effect == "enchant weapon":
+            self._weapon_cursed = False
+
+        if count <= 1:
+            self._pack.pop(slot, None)
+        else:
+            noun = "A scroll" if count - 1 == 1 else f"{count - 1} scrolls"
+            self._pack[slot] = re.sub(
+                r"^(?:an?|\d+)\s+scrolls?", noun, desc.strip(), count=1, flags=re.IGNORECASE
+            )
+        self._inventory_dirty = True
+        return collected
+
+    def _should_read_known_scroll(
+        self, kind: str, slot: str, count: int
+    ) -> bool:
+        """True if a known scroll of `kind` is worth reading right now (no monster in view)."""
+        if kind in ("enchant armor", "protect armor"):
+            return any(d.endswith("(being worn)") for d in self._pack.values())
+        if kind == "enchant weapon":
+            return any(d.endswith("(weapon in hand)") for d in self._pack.values())
+        if kind in _SCROLLS_READ_WHEN_SAFE:
+            return True
+        if kind == "remove curse":
+            return (
+                self._armor_cursed
+                or self._weapon_cursed
+                or any(self._ring_cursed.values())
+            )
+        if kind.startswith("identify"):
+            return bool(self._identify_candidates(kind, slot, count)[0])
+        return False
+
+    def _try_read_scrolls(self) -> list[str]:
+        """Read one scroll when no monster is in view: known useful ones, or each unknown title once."""
+        for slot, desc in list(self._pack.items()):
+            parsed = self._parse_scroll(desc)
+            if parsed is None:
+                continue
+            count, kind, key = parsed
+            if kind is None:
+                if (
+                    key not in self._tried_scroll_keys
+                    and self._status.hp >= self._status.max_hp
+                ):
+                    return self._read_scroll_slot(slot, desc, count, kind, key)
+            elif self._should_read_known_scroll(kind, slot, count):
+                return self._read_scroll_slot(slot, desc, count, kind, key)
+        return []
+
+    def _try_emergency_scroll(self) -> list[str]:
+        """Read a known teleportation or hold monster scroll when nearly dead beside a monster."""
+        parsed_status = parse_status(self.client.get_lines()[23])
+        status = parsed_status if parsed_status is not None else self._status
+        if status.hp <= 0 or status.hp >= 0.25 * max(1, status.max_hp):
+            return []
+        lines = self.client.get_lines()
+        pos = find_player(lines)
+        if pos is None or not any(
+            "A" <= lines[r][c] <= "Z"
+            for r in range(max(1, pos[0] - 1), min(22, pos[0] + 1) + 1)
+            for c in range(max(0, pos[1] - 1), min(len(lines[r]) - 1, pos[1] + 1) + 1)
+        ):
+            return []
+        collected: list[str] = []
+        if self._inventory_dirty:
+            collected.extend(self._refresh_inventory())
+        for target in _SCROLLS_FOR_ESCAPE:
+            for slot, desc in list(self._pack.items()):
+                scroll = self._parse_scroll(desc)
+                if scroll is not None and scroll[1] == target:
+                    collected.extend(
+                        self._read_scroll_slot(slot, desc, scroll[0], target, scroll[2])
+                    )
+                    return collected
+        return collected
+
     @staticmethod
     def _missile_value(desc: str) -> Optional[tuple[int, float]]:
         """Parse a throwable missile pack entry into (count, score), or None."""
@@ -830,18 +1075,24 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         return any("A" <= ch <= "Z" for row in lines[1:23] for ch in row)
 
     def _run_auto_actions(self) -> list[str]:
-        """Run scripted inventory refresh and auto-equip/quaff/missile/ring actions."""
+        """Run scripted inventory refresh and auto-equip/quaff/read/missile/ring actions."""
         collected: list[str] = []
         collected.extend(self._try_heal_quaff())
         if self._monster_in_view(self.client.get_lines()):
-            collected.extend(self._try_throw_missile())
+            escaped = self._try_emergency_scroll()
+            collected.extend(escaped)
+            if not escaped:
+                collected.extend(self._try_throw_missile())
             return collected
         if self._inventory_dirty:
             collected.extend(self._refresh_inventory())
         collected.extend(self._try_auto_wield())
         collected.extend(self._try_auto_wear())
         collected.extend(self._try_auto_rings())
-        collected.extend(self._try_safe_quaff())
+        quaffed = self._try_safe_quaff()
+        collected.extend(quaffed)
+        if not quaffed:
+            collected.extend(self._try_read_scrolls())
         return collected
 
     def _ring_value(

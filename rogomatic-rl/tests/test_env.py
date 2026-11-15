@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import gymnasium as gym
 import numpy as np
 import pytest
@@ -193,12 +195,15 @@ class _FakeClient:
         self._lines = initial
         self.keys: list[str] = []
         self.alive = True
+        # Messages Rogue printed and the client collected before the final
+        # screen, per key (e.g. text that a following prompt replaced).
+        self.extra_messages: dict[str, list[str]] = {}
 
     def send_key(self, key: str) -> list[str]:
         self.keys.append(key)
         self._lines = self._screens.get(key, self._lines)
         top = self._lines[0].strip()
-        return [top] if top else []
+        return self.extra_messages.get(key, []) + ([top] if top else [])
 
     def get_lines(self) -> list[str]:
         return list(self._lines)
@@ -1190,3 +1195,241 @@ def test_real_rogue_picks_up_and_puts_on_ring() -> None:
 
 
 
+
+
+def _scroll_env(
+    pack: dict[str, str],
+    screens: dict[str, list[str]],
+    hp: int = 12,
+    monster: Optional[tuple[int, int]] = None,
+) -> tuple[RogueEnv, list[str]]:
+    """A fake env standing at (5, 5) with `pack`; returns it and the idle screen."""
+    room = _room()
+    if monster is not None:
+        room = _with(room, monster[0], monster[1], "H")
+    idle = _with(room, 23, 0, _status_line(hp=hp, max_hp=12))
+    env = _fake_env({".": idle, **screens}, idle)
+    env._last_pos = (5, 5)
+    env._status = parse_status(idle[23]) or RogueStatus()
+    env._pack = dict(pack)
+    return env, idle
+
+
+def test_parse_scroll_reads_known_titled_called_and_plural_entries() -> None:
+    env = _fake_env({}, _blank_screen())
+    assert env._parse_scroll("A scroll of enchant armor") == (1, "enchant armor", "of:enchant armor")
+    assert env._parse_scroll("3 scrolls of identify ring, wand or staff") == (
+        3,
+        "identify ring, wand or staff",
+        "of:identify ring, wand or staff",
+    )
+    assert env._parse_scroll("2 scrolls titled 'foo bar baz'") == (
+        2,
+        None,
+        "titled:foo bar baz",
+    )
+    assert env._parse_scroll("A scroll called keeper") == (1, None, "called:keeper")
+    assert env._parse_scroll("2 pink potions") is None
+    env._known_scroll_titles["titled:foo bar baz"] = "remove curse"
+    assert env._parse_scroll("A scroll titled 'foo bar baz'")[1] == "remove curse"
+
+
+def test_reads_unknown_scroll_once_when_safe_and_dismisses_call_it() -> None:
+    read_prompt = _with(_room(), 0, 0, "read what? (* for list): ")
+    call_it = _with(_room(), 0, 0, "call it: ")
+    env, idle = _scroll_env(
+        {"f": "2 scrolls titled 'xyzzy plugh'"},
+        {"r": read_prompt, "f": call_it, "\x1b": _with(idle_room(), 0, 0, "")},
+    )
+    env.step(8)
+    assert env.client.keys == [".", "r", "f", "\x1b"]
+    assert env._pack["f"] == "A scroll titled 'xyzzy plugh'"
+
+    # The same title is not read again: its kind is unknown but it was tried.
+    env.client.keys.clear()
+    env.step(8)
+    assert "r" not in env.client.keys
+
+
+def idle_room() -> list[str]:
+    return _with(_room(), 23, 0, _status_line(hp=12, max_hp=12))
+
+
+def test_unknown_scroll_not_read_when_hurt_or_monster_in_view() -> None:
+    pack = {"f": "A scroll titled 'abc'"}
+    hurt, _ = _scroll_env(pack, {}, hp=9)
+    hurt.step(8)
+    assert hurt.client.keys == ["."]
+
+    far_monster, _ = _scroll_env(pack, {}, monster=(5, 20))
+    far_monster.step(8)
+    assert far_monster.client.keys == ["."]
+
+
+def test_message_inference_learns_enchant_armor_and_uncurses_armor() -> None:
+    glows = _with(idle_room(), 0, 0, "your armor glows silver for a moment")
+    call_it = _with(glows, 0, 0, "call it: ")
+    env, _ = _scroll_env(
+        {"b": "+1 ring mail [4] (being worn)", "f": "2 scrolls titled 'qq rr'"},
+        {"r": _with(idle_room(), 0, 0, "read what? (* for list): "), "f": call_it},
+    )
+    env._armor_cursed = True
+    env.client._screens["\x1b"] = idle_room()
+    env.client.extra_messages["f"] = ["your armor glows silver for a moment"]
+
+    env.step(8)
+    assert env.client.keys == [".", "r", "f", "\x1b"]
+    assert env._known_scroll_titles["titled:qq rr"] == "enchant armor"
+    assert env._armor_cursed is False
+
+    # The second copy is now a known enchant armor scroll and is read at once.
+    # (The pack refresh after a read has no fake inventory screen here.)
+    env._inventory_dirty = False
+    env.client.keys.clear()
+    env.step(8)
+    assert env.client.keys[:3] == [".", "r", "f"]
+
+
+def test_identify_prompt_is_answered_with_unidentified_item_never_escape() -> None:
+    prompt = _with(idle_room(), 0, 0, "identify what? (* for list): ")
+    env, idle = _scroll_env(
+        {
+            "b": "+1 ring mail [4] (being worn)",
+            "c": "A +1,+1 mace (weapon in hand)",
+            "d": "A ring of protection [+1](ruby)",
+            "e": "A pink potion",
+            "f": "A scroll titled 'abc def'",
+            "g": "A ring of regeneration(opal)",
+        },
+        {
+            "r": _with(idle_room(), 0, 0, "read what? (* for list): "),
+            "f": prompt,
+            "e": _with(idle_room(), 0, 0, "A potion of healing(pink) (e)"),
+        },
+    )
+    env.client.extra_messages["f"] = ["this scroll is an identify potion scroll"]
+    env.step(8)
+    assert "\x1b" not in env.client.keys
+    assert env.client.keys[-1] == "e"  # the unidentified potion, not a known item
+
+
+def test_identify_with_nothing_of_that_type_escapes_via_star_not_escape() -> None:
+    prompt = _with(idle_room(), 0, 0, "identify what? (* for list): ")
+    env, _ = _scroll_env(
+        {"b": "+1 ring mail [4] (being worn)", "f": "A scroll of identify ring, wand or staff"},
+        {
+            "r": _with(idle_room(), 0, 0, "read what? (* for list): "),
+            "f": prompt,
+            "*": _with(idle_room(), 0, 0, "nothing appropriate"),
+        },
+    )
+    # Known identify scroll with no ring/wand/staff in the pack is not read at all.
+    env.step(8)
+    assert env.client.keys == ["."]
+
+    # An unknown scroll that turns out to be identify ring/wand/staff: '*' exits.
+    env._pack["f"] = "A scroll titled 'zz top'"
+    env.client.extra_messages["f"] = [
+        "this scroll is an identify ring, wand or staff scroll"
+    ]
+    env.client.keys.clear()
+    env.step(8)
+    assert env.client.keys[:3] == [".", "r", "f"]
+    assert "\x1b" not in env.client.keys
+    assert "*" in env.client.keys
+
+
+def test_known_scrolls_read_only_when_useful_and_bad_ones_never() -> None:
+    env, _ = _scroll_env(
+        {
+            "b": "+1 ring mail [4] (being worn)",
+            "c": "A +1,+1 mace (weapon in hand)",
+            "d": "A scroll of scare monster",
+            "e": "A scroll of aggravate monsters",
+            "f": "A scroll of teleportation",
+            "g": "A scroll of create monster",
+            "h": "A scroll of sleep",
+            "i": "A scroll of hold monster",
+            "j": "A scroll of remove curse",
+        },
+        {},
+    )
+    env.step(8)
+    assert env.client.keys == ["."]  # nothing here is worth reading now
+
+    env._armor_cursed = True
+    env.client.keys.clear()
+    env.step(8)
+    assert env.client.keys[:3] == [".", "r", "j"]
+    assert env._armor_cursed is False
+
+
+def test_emergency_teleport_then_hold_monster_when_nearly_dead_beside_monster() -> None:
+    low = _with(_room(), 5, 6, "H")
+    low = _with(low, 23, 0, _status_line(hp=2, max_hp=12))
+    safe = _with(_room(), 23, 0, _status_line(hp=2, max_hp=12))
+    env = _fake_env(
+        {
+            ".": low,
+            "r": _with(low, 0, 0, "read what? (* for list): "),
+            "g": safe,
+            "h": safe,
+        },
+        low,
+    )
+    env._last_pos = (5, 5)
+    env._status = parse_status(low[23]) or RogueStatus()
+    env._pack = {"g": "A scroll of teleportation", "h": "A scroll of hold monster"}
+
+    env.step(8)
+    assert env.client.keys == [".", "r", "g"]
+    assert "g" not in env._pack
+
+    # Without teleportation the hold monster scroll is used instead. (The pack
+    # refresh that follows a read has no fake inventory screen here.)
+    env._inventory_dirty = False
+    env.client._lines = low
+    env.client.keys.clear()
+    env.step(8)
+    assert env.client.keys == [".", "r", "h"]
+
+
+def test_emergency_scroll_needs_low_hp_and_an_adjacent_monster() -> None:
+    pack = {"g": "A scroll of teleportation"}
+    adjacent_ok, _ = _scroll_env(pack, {}, hp=9, monster=(5, 6))
+    adjacent_ok.step(8)
+    assert "r" not in adjacent_ok.client.keys  # hp 9/12 is not an emergency
+
+    distant, _ = _scroll_env(pack, {}, hp=2, monster=(5, 20))
+    distant.step(8)
+    assert "r" not in distant.client.keys  # monster is not adjacent
+
+
+def test_real_rogue_reads_scrolls_and_leaves_no_prompt_behind() -> None:
+    env = RogueEnv(max_steps=20, fixed_dungeons=True)
+    try:
+        # Dungeon 1044: a scroll one tile left of the player at start. It is
+        # identify potion, and with no potion in the pack the env must leave
+        # the `identify what?` prompt via '*' (ESC would loop forever).
+        env.reset(seed=1044)
+        _, _, terminated, _, info = env.step(0)  # 'h'
+        assert terminated is False
+        assert any("identify potion scroll" in m.lower() for m in info["messages"])
+        assert not any("scroll" in d.lower() for d in env._pack.values())
+        _, _, terminated, _, _ = env.step(8)  # '.' proves the game accepts commands again
+        assert terminated is False
+        assert "what?" not in env.client.get_lines()[0].lower()
+
+        # Dungeon 1033: a scroll diagonally down-right of the player. It is
+        # monster confusion, which Rogue leaves unnamed (`call it:`), so the env
+        # dismisses the prompt and infers the kind from the message.
+        env.reset(seed=1033)
+        _, _, terminated, _, info = env.step(7)  # 'n'
+        assert terminated is False
+        assert any("hands begin to glow" in m.lower() for m in info["messages"])
+        assert env._known_scroll_titles == {"titled:zok pay reazum": "monster confusion"}
+        assert "call it" not in env.client.get_lines()[0].lower()
+        _, _, terminated, _, _ = env.step(8)
+        assert terminated is False
+    finally:
+        env.close()
