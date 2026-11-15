@@ -539,3 +539,327 @@ def test_experience_is_rewarded_per_point_up_to_a_cap_and_per_level() -> None:
     )
     # Losing a level (a wraith's drain) is not rewarded or charged here.
     assert _reward(RogueStatus(exp=10, exp_level=2), start) == pytest.approx(0.0)
+
+
+def _status_line(
+    *,
+    level: int = 1,
+    gold: int = 0,
+    hp: int = 12,
+    max_hp: int = 12,
+    strength: int = 16,
+    max_strength: int = 16,
+    armor: int = 4,
+    exp_level: int = 1,
+    exp: int = 0,
+) -> str:
+    return (
+        f"Level: {level}  Gold: {gold:<6d} Hp: {hp}({max_hp})  "
+        f"Str: {strength}({max_strength})  Arm: {armor}   Exp: {exp_level}/{exp}"
+    )
+
+
+def _inv_overlay(*items: str) -> list[str]:
+    lines = _blank_screen()
+    for row, item in enumerate(items):
+        lines = _with(lines, row, 40, item)
+    lines = _with(lines, len(items), 40, "--Press space to continue--")
+    return _with(lines, 23, 0, _status_line())
+
+
+def test_auto_wield_upgrades_to_better_melee_weapon() -> None:
+    before = _with(_room(), 5, 6, ")")
+    before = _with(before, 23, 0, _status_line())
+
+    picked_up = _with(_room(), 5, 6, "@")
+    picked_up = _with(picked_up, 5, 5, ".")
+    picked_up = _with(picked_up, 0, 0, "A long sword (f)")
+    picked_up = _with(picked_up, 23, 0, _status_line())
+
+    inv = _inv_overlay(
+        "a) Some food",
+        "b) +1 ring mail [4] (being worn)",
+        "c) A +1,+1 mace (weapon in hand)",
+        "f) A long sword",
+        "g) A dagger",
+    )
+    wield_prompt = _with(picked_up, 0, 0, "wield what? (* for list): ")
+    wielded = _with(picked_up, 0, 0, "wielding a long sword (f)")
+
+    env = _fake_env(
+        {
+            "l": picked_up,
+            "i": inv,
+            " ": picked_up,
+            "w": wield_prompt,
+            "f": wielded,
+        },
+        before,
+    )
+    env._last_pos = (5, 5)
+    env._status = parse_status(before[23]) or RogueStatus()
+
+    _, _, _, _, info = env.step(3)  # 'l' onto the long sword
+
+    assert env.client.keys == ["l", "i", " ", "w", "f"]
+    assert any("wielding a long sword" in m.lower() for m in info["messages"])
+    # Stepping again with no new pickup does not re-wield or wield the weaker dagger.
+    env.client.keys.clear()
+    env.step(0)  # 'h'
+    assert "w" not in env.client.keys
+
+
+def test_auto_wear_takes_off_old_armor_and_wears_strictly_better_armor() -> None:
+    before = _with(_room(), 5, 6, "]")
+    before = _with(before, 23, 0, _status_line(armor=4))
+
+    picked_up = _with(_room(), 5, 6, "@")
+    picked_up = _with(picked_up, 5, 5, ".")
+    picked_up = _with(picked_up, 0, 0, "Chain mail (f)")
+    picked_up = _with(picked_up, 23, 0, _status_line(armor=4))
+
+    # Scale mail (base Arm 4) ties +1 ring mail [4], so only chain mail (base Arm 5) beats it.
+    inv = _inv_overlay(
+        "b) +1 ring mail [4] (being worn)",
+        "c) A +1,+1 mace (weapon in hand)",
+        "e) Scale mail",
+        "f) Chain mail",
+    )
+    took_off = _with(picked_up, 0, 0, "was wearing b) +1 ring mail [4]")
+    took_off = _with(took_off, 23, 0, _status_line(armor=0))
+    wear_prompt = _with(took_off, 0, 0, "wear what? (* for list): ")
+    worn = _with(took_off, 0, 0, "wearing +0 chain mail [5]")
+    worn = _with(worn, 23, 0, _status_line(armor=5))
+
+    env = _fake_env(
+        {
+            "l": picked_up,
+            "i": inv,
+            " ": picked_up,
+            "T": took_off,
+            "W": wear_prompt,
+            "f": worn,
+        },
+        before,
+    )
+    env._last_pos = (5, 5)
+    env._status = parse_status(before[23]) or RogueStatus()
+
+    _, _, _, _, info = env.step(3)  # 'l' onto chain mail
+
+    assert env.client.keys == ["l", "i", " ", "T", "W", "f"]
+    assert env._status.armor == 5
+    assert any("wearing +0 chain mail [5]" in m.lower() for m in info["messages"])
+
+    # Next step does not swap back to +1 ring mail [4] or try scale mail (base 4).
+    env.client.keys.clear()
+    env.step(0)  # 'h'
+    assert "T" not in env.client.keys and "W" not in env.client.keys
+
+
+def test_auto_equip_waits_until_no_monster_in_view_and_stops_when_cursed() -> None:
+    # A hobgoblin 'H' is in the room when the player picks up plate mail and a two-handed sword.
+    with_monster = _with(_room(), 5, 6, "@")
+    with_monster = _with(with_monster, 4, 4, "H")
+    with_monster = _with(with_monster, 0, 0, "Plate mail (f)")
+    with_monster = _with(with_monster, 23, 0, _status_line(armor=4))
+
+    inv = _inv_overlay(
+        "b) -1 ring mail [2] (being worn)",
+        "c) A -1,-1 mace (weapon in hand)",
+        "f) Plate mail",
+        "g) A two handed sword",
+    )
+    clear_room = _with(_room(), 5, 6, "@")
+    clear_room = _with(clear_room, 23, 0, _status_line(armor=2))
+    cursed_msg = _with(clear_room, 0, 0, "you can't.  It appears to be cursed")
+
+    env = _fake_env(
+        {
+            "l": with_monster,
+            "i": inv,
+            " ": clear_room,
+            "w": cursed_msg,
+            "T": cursed_msg,
+            ".": clear_room,
+        },
+        _with(_room(), 23, 0, _status_line(armor=2)),
+    )
+    env._last_pos = (5, 5)
+    env._status = parse_status(with_monster[23]) or RogueStatus()
+
+    # Step 1: monster is in view, so no equip happens yet.
+    env.step(3)  # 'l'
+    assert env.client.keys == ["l"]
+
+    # Step 2: monster is gone; env tries to wield and take off armor, sees both are cursed.
+    env.client.keys.clear()
+    env.step(8)  # '.'
+    assert env.client.keys == [".", "i", " ", "w", "T"]
+
+    # Step 3: now that both slots are known cursed, env does not retry either.
+    env.client.keys.clear()
+    env.step(8)  # '.'
+    assert env.client.keys == ["."]
+
+
+def test_quaffs_unknown_potion_when_safe_and_dismisses_call_it_prompt() -> None:
+    before = _with(_room(), 5, 6, "!")
+    before = _with(before, 23, 0, _status_line(hp=12, max_hp=12))
+
+    picked_up = _with(_room(), 5, 6, "@")
+    picked_up = _with(picked_up, 5, 5, ".")
+    picked_up = _with(picked_up, 0, 0, "2 pink potions (f)")
+    picked_up = _with(picked_up, 23, 0, _status_line(hp=12, max_hp=12))
+
+    inv = _inv_overlay(
+        "b) +1 ring mail [4] (being worn)",
+        "c) A +1,+1 mace (weapon in hand)",
+        "f) 2 pink potions",
+    )
+    quaff_prompt = _with(picked_up, 0, 0, "quaff what? (* for list): ")
+    # Monster detection with no monsters leaves oi_know false and prompts "call it: ".
+    call_it = _with(picked_up, 0, 0, "call it: ")
+    dismissed = _with(picked_up, 0, 0, "")
+
+    env = _fake_env(
+        {
+            "l": picked_up,
+            "i": inv,
+            " ": picked_up,
+            "q": quaff_prompt,
+            "f": call_it,
+            "\x1b": dismissed,
+            ".": dismissed,
+        },
+        before,
+    )
+    env._last_pos = (5, 5)
+    env._status = parse_status(before[23]) or RogueStatus()
+
+    env.step(3)  # 'l' onto the 2 pink potions
+
+    assert env.client.keys == ["l", "i", " ", "q", "f", "\x1b"]
+
+    # The remaining pink potion in the stack is now known to be tried, so it is not drunk again.
+    env.client.keys.clear()
+    env.step(8)  # '.'
+    assert "q" not in env.client.keys
+
+
+def test_quaffs_healing_potion_below_quarter_health_even_in_combat() -> None:
+    combat = _with(_room(), 5, 6, "H")
+    half_hp = _with(combat, 23, 0, _status_line(hp=6, max_hp=12))
+    low_hp = _with(combat, 23, 0, _status_line(hp=2, max_hp=12))
+    healed = _with(combat, 0, 0, "you begin to feel better")
+    healed = _with(healed, 23, 0, _status_line(hp=8, max_hp=12))
+    quaff_prompt = _with(low_hp, 0, 0, "quaff what? (* for list): ")
+
+    env = _fake_env(
+        {
+            "l": half_hp,
+            "q": quaff_prompt,
+            "d": healed,
+        },
+        half_hp,
+    )
+    env._last_pos = (5, 5)
+    env._status = parse_status(half_hp[23]) or RogueStatus()
+    env._pack = {"d": "A potion of healing(blue)"}
+
+    # At 50% HP (6/12), healing potion is saved.
+    env.step(3)  # 'l' attack
+    assert env.client.keys == ["l"]
+
+    # When an attack step leaves HP at 2/12 (< 25%), the healing potion is drunk immediately.
+    env.client._screens["l"] = low_hp
+    env.client.keys.clear()
+    _, reward, _, _, info = env.step(3)  # 'l' attack
+
+    assert env.client.keys == ["l", "q", "d"]
+    assert info["hp"] == 8
+    assert "d" not in env._pack
+    # Reward reflects net HP change from 6/12 -> 8/12 (+2/12 * REWARD_HEALTH) minus step penalty.
+    assert reward == pytest.approx(-0.002 + (2 / 12) * REWARD_HEALTH)
+
+
+def test_quaffs_known_buff_potions_and_ignores_known_bad_potions() -> None:
+    room = _with(_room(), 23, 0, _status_line(hp=12, max_hp=12, strength=14, max_strength=16))
+    quaff_prompt = _with(room, 0, 0, "quaff what? (* for list): ")
+    restored = _with(room, 0, 0, "hey, this tastes great.  It make you feel warm all over")
+    restored = _with(restored, 23, 0, _status_line(hp=12, max_hp=12, strength=16, max_strength=16))
+
+    env = _fake_env(
+        {
+            ".": room,
+            "q": quaff_prompt,
+            "e": restored,
+        },
+        room,
+    )
+    env._last_pos = (5, 5)
+    env._status = parse_status(room[23]) or RogueStatus()
+    env._pack = {
+        "d": "A potion of poison(red)",
+        "e": "A murky potion",
+        "f": "A potion of blindness(black)",
+    }
+    # Suppose murky was previously discovered to be restore strength.
+    env._tried_potion_colors.add("murky")
+    env._known_potion_colors["murky"] = "restore strength"
+
+    # Since strength is 14(16), the env drinks the murky restore-strength potion and ignores poison/blindness.
+    env.step(8)  # '.'
+    assert env.client.keys == [".", "q", "e"]
+    assert env._status.strength == 16
+
+    # Once strength is back to 16(16), another restore-strength or bad potion is not drunk.
+    env.client._screens["."] = restored
+    env._pack["g"] = "A murky potion"
+    env.client.keys.clear()
+    env.step(8)  # '.'
+    assert env.client.keys == ["."]
+
+
+def test_real_rogue_auto_equips_and_quaffs_on_fixed_dungeons() -> None:
+    env = RogueEnv(max_steps=10, fixed_dungeons=True)
+    try:
+        # Dungeon 1030 has splint mail one tile left of the player at start.
+        env.reset(seed=1030)
+        assert env._status.armor == 4
+        _, _, terminated, _, info = env.step(0)  # 'h'
+        assert terminated is False
+        assert env._status.armor == 5
+        assert any("wearing" in m.lower() and "splint mail" in m.lower() for m in info["messages"])
+
+        # Dungeon 1004 has an unidentified potion one tile above the player at start.
+        env.reset(seed=1004)
+        _, _, terminated, _, info = env.step(2)  # 'k'
+        assert terminated is False
+        assert any("potion" in m.lower() for m in info["messages"])
+        assert "f" not in env._pack
+    finally:
+        env.close()
+
+
+def test_stepping_onto_hallucinated_stairs_with_no_pickup_message_enables_descend() -> None:
+    # Under hallucination, an unseen staircase is drawn as a random item glyph (e.g. '?'),
+    # so stepping onto it produces no pickup message from Rogue.
+    before = _with(_room(), 5, 6, "?")
+    after = _with(_room(), 5, 6, "@")
+    after = _with(after, 5, 5, ".")
+
+    env = _fake_env({"l": after}, before)
+    env._last_pos = (5, 5)
+    obs, _, _, _, _ = env.step(3)  # 'l'
+
+    assert env._tile_under_player == "%"
+    assert obs["action_mask"][10] == 1  # '>' descend stairs is legal
+
+
+
+
+
+
+
+

@@ -1,7 +1,7 @@
 # Rog-O-Matic RL Handoff
 
-Written 2026-11-14 16:55 PST. Replaces the earlier handoff; the
-previous text is in git history (`git log -- HANDOFF.md`).
+Written 2026-11-14 16:55 PST, updated 17:24 PST. The previous
+handoff is in git history (`git log -- HANDOFF.md`).
 
 ## 1. What this project is
 
@@ -31,9 +31,9 @@ pseudo-terminal.
           --episode-log logs/reward-v2/episodes.jsonl \
           --eval-log logs/reward-v2/evals.jsonl
 
-- Text log: `rogomatic-rl/train_reward_v2.log`. It was at update
-  440 of 5859, about 470 steps/s, so it should finish around
-  23:30.
+- Text log: `rogomatic-rl/train_reward_v2.log`. At 17:24 it was at
+  update 780 of 5859, about 468 steps/s, so it should finish
+  around 23:30.
 - It writes `checkpoints/rogomatic_ppo_latest.pt`.
 - To stop it: list the process with
   `pgrep -af "train_ppo.py --init-from"`, then send that PID an
@@ -51,6 +51,11 @@ Do the new rewards improve play beyond the fight-back mask alone?
 | Before the mask, old rewards | 1.6-2.1 |
 | Mask only, old rewards (4 evaluations) | 2.79 (2.64-2.90) |
 | Rewards v2, update 250 | 2.92 |
+| Rewards v2, update 500 | 3.34 |
+| Rewards v2, update 750 | 2.44 |
+
+The three rewards-v2 evaluations average 2.90, level with the
+baseline: the 3.34 at update 500 was not a trend.
 
 - Each evaluation is 50 sampled games on dungeons 1000-1049.
   Differences of about 0.3 are noise.
@@ -62,10 +67,10 @@ Do the new rewards improve play beyond the fight-back mask alone?
 
 ### Git state
 
-All the work is committed and merged into local `main`, as a
-fast-forward from `feat/episode-stats-and-fixed-eval` (which is on
-`origin`). `main` was not pushed when this was written; check with
-`git status -sb`. There is no pull request.
+Everything up to the rewards and replays is on `main` and pushed
+(`origin/main` at `0a5f941`). The working tree is on a new branch,
+`feat/auto-equip-and-quaff`, made from `main` for #8 and #9. It has
+no commits or code changes yet; only this file differs.
 
 Left out of the commits on purpose:
 
@@ -158,28 +163,123 @@ checkpoint; `--no-normalize-reward` turns it off).
 
 | Issue | Status |
 |---|---|
-| #8 auto-equip armor and weapons | Not started; next in line |
-| #9 quaff potions | Not started; after #8 |
+| #8 auto-equip armor and weapons | In progress; research done, no code yet (section 7) |
+| #9 quaff potions | In progress; research done, no code yet (section 7) |
 | #13 why games end shallow | Mostly answered (combat); step-limit games on levels 1-2 remain |
-| #11, #12, #16, #17 | Done and merged to local `main`; the commit messages say `Closes`, so they close when `main` is pushed |
-| #10 high score list | Done and merged; the commit only references it, so close by hand |
-| #14, #15 rewards | Done and merged, but the commit says `Refs`, so they stay open until the run's evaluations confirm the gain; close by hand |
+| #14, #15 rewards | Merged with `Refs`; open until the run is judged, then close by hand |
+| #10, #11, #12, #16, #17 | Closed |
 
 No issue exists for an ascend (`<`) action or for a rest rule.
 
-## 7. Suggested next steps
+## 7. In progress: #8 and #9
 
-1. When the run finishes, or after several evaluations, compare
-   its `eval` lines with the 2.79 baseline and decide whether
-   rewards v2 stays.
-2. Push `main` when the user asks, which closes #11, #12, #16 and
-   #17.
-3. Close #10, #14 and #15 by hand once the run has been judged.
-4. Start #8 (auto-equip). It needs inventory tracking, which #9
-   reuses. The multi-line inventory overlay needs care; see how
-   `_try_auto_eat` handles it.
+The user asked to implement both. Work was interrupted after reading
+the Rogue source, before any design was settled or code written.
+Both are meant to be scripted in the env, like `_try_auto_eat`, and
+to share one inventory tracker.
 
-## 8. Useful commands
+### Facts from the Rogue 5.4 source (`rogue5.4/`)
+
+Inventory and prompts:
+
+- `i` lists the whole pack and takes no game turn. With one item
+  Rogue prints it on the message line. With several it draws an
+  overlay at the top right, one `x) name` line per item, ending in
+  `--Press space to continue--` (`add_line` and `end_line`).
+  `_overlay_slot` and `_dismiss_overlay` in `env.py` already deal
+  with this for food.
+- Items in use carry ` (being worn)` or ` (weapon in hand)`
+  (`inv_name` in `things.c`; `inv_describe` is on by default).
+- A pickup prints `<name> (x)` in terse mode (`add_pack` in
+  `pack.c`), which can trigger an inventory refresh.
+- Item prompts read `wear what? (* for list): ` in terse mode (the
+  same for `wield`, `quaff`). ESC cancels without using a turn.
+
+Item names (`inv_name`, `nameit`, `num`):
+
+- Armor, unidentified: `Scale mail`. Identified: `+1 ring mail [4]`
+  (no `protection` in terse mode). The bracket is 10 minus the
+  armor value, the same scale as `Arm:` on the status line.
+- Weapon, unidentified: `A long sword`. Identified:
+  `A +1,+1 mace`. Stacks: `25 arrows`.
+- Potion, unidentified: `A pink potion` or `2 pink potions`.
+  Identified: `A potion of healing(pink)`. Named by the player:
+  `A potion called X(pink)`.
+
+Equipment:
+
+- Base armor class, lower is better (`a_class`, `extern.c`):
+  leather 8, ring mail 7, studded leather 7, scale 6, chain 5,
+  splint 4, banded 4, plate 3. The player starts in +1 ring mail
+  (`Arm: 4`).
+- Wielded damage (`init_dam`, `weapons.c`): mace 2x4, long sword
+  3x4, two handed sword 4x4, spear 2x3, dagger 1x6, shuriken 1x2,
+  bow, arrow and dart 1x1. The player starts with a +1,+1 mace.
+- `W` refuses while armor is worn (`you are already wearing some`),
+  so take it off with `T` first. Wearing takes extra turns
+  (`waste_time`) and identifies the armor.
+- `T` and `w` fail on a cursed item in use:
+  `you can't.  It appears to be cursed`. A cursed item is stuck.
+- Messages: `wearing <name>`, `was wearing x) <name>`,
+  `wielding <name> (x)`.
+
+Potions (`potions.c`, frequencies out of 100 in `pot_info`):
+
+- Good: healing 13 (heals level d4, cures blindness, +1 max hp if
+  it overflows), extra healing 5 (level d8, also cures
+  hallucination), gain strength 13, restore strength 13, raise
+  level 2, haste self 5, see invisible 3.
+- Neutral-ish: monster detection 6, magic detection 6, levitation 6
+  (cannot take stairs while floating).
+- Bad: confusion 7 (20 turns), hallucination 8 (850 turns, changes
+  monster and item letters), poison 8 (lose 1-4 strength until
+  restored), blindness 5 (850 turns).
+- After drinking a potion that is still unidentified, Rogue asks
+  `call it: ` (`call_it`). The env must answer with ESC, or the
+  game sits at that prompt.
+- Healing is weak early: 1d4 at experience level 1.
+
+Known hazards for the env:
+
+- Blindness: unseen squares are blank, which the action mask reads
+  as walls, so the agent may be stuck resting for up to 850 turns
+  (the issue's own warning).
+- Hallucination: monsters still show as capital letters, so the
+  fight-back mask keeps working, but `killed_by` and the replay
+  colouring see random letters.
+
+### Open design decisions
+
+- Whether to drink unknown potions to identify them when safe
+  (full hp, no monster in view), as the original Rog-O-Matic did,
+  or only drink potions already known. Blindness is the main risk
+  of the first.
+- When to drink healing: an hp threshold, and whether to drink an
+  unknown potion in an emergency.
+- What counts as better armor or weapon before identification:
+  compare base types only, or accept the cursed-item risk.
+- Whether successful equips or quaffs earn a shaping reward.
+
+### Safety notes for the code change
+
+- The running trainer uses forked workers that already imported the
+  old code, and fixed evaluations fork from it too, so editing
+  `env.py` does not affect that run.
+- Test with `_FakeClient` scripted screens in `tests/test_env.py`,
+  then on the real binary (`RogueEnv(fixed_dungeons=True)` gives a
+  repeatable dungeon).
+
+## 8. Suggested next steps
+
+1. When the run finishes, compare its `eval` lines with the 2.79
+   baseline and decide whether rewards v2 stays; then close #14 and
+   #15.
+2. Settle the open decisions in section 7 with the user, then build
+   the inventory tracker, #8 and #9 test-first.
+3. Measure each with a fixed evaluation of the same checkpoint with
+   the feature on and off, as was done for the fight-back mask.
+
+## 9. Useful commands
 
 Run from `rogomatic-rl/`.
 
@@ -207,7 +307,7 @@ Run from `rogomatic-rl/`.
 
 Evaluation and recording are safe to run while training.
 
-## 9. Suggested skills
+## 10. Suggested skills
 
 - `tdd`: for #8 and #9, test-first in `tests/test_env.py` with the
   `_FakeClient` scripted screens.

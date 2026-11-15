@@ -69,9 +69,54 @@ REWARD_EXP_LEVEL = 3.0  # per experience level gained
 _OVERLAY_PROMPT = "--Press space to continue--"
 # Pack-add message for food, e.g. "2 rations of food (a)", "a slime-mold (c)".
 _FOOD_PICKUP_RE = re.compile(r"(?:food|slime-mold)\s*\([a-z]\)")
+# Pack-add message for any item: "<inv_name> (x)" (add_pack in pack.c).
+_PICKUP_RE = re.compile(r"^(?!wielding\b|was wearing\b|wearing\b).+\([a-z]\)\s*$", re.IGNORECASE)
 # Messages printed by eat() in misc.c when food is actually consumed.
 _ATE_RE = re.compile(r"tasted good|tastes awful|that was a yummy")
 _SLOT_RE = re.compile(r"^\s*([a-z])\) ")
+_ITEM_LINE_RE = re.compile(r"^\s*([a-z])\)\s+(.+?)\s*$")
+_WEAPON_BONUS_RE = re.compile(r"^an?\s+(?:([+-]\d+),([+-]\d+)\s+)?(.+?)(?:\s+called\s+.+)?$", re.IGNORECASE)
+
+# Mean melee damage by weapon name (init_dam in weapons.c).
+# Ranged/thrown items (short bow, arrow, dart, shuriken) are omitted so they are never wielded.
+_WEAPON_BASE_DAMAGE: dict[str, float] = {
+    "two handed sword": 10.0,  # 4d4
+    "long sword": 7.5,         # 3d4
+    "mace": 5.0,               # 2d4
+    "spear": 4.0,              # 2d3
+    "dagger": 3.5,             # 1d6
+}
+# Starting weapon is a +1,+1 mace: 5.0 + 0.5*1 + 1.0 = 6.5.
+_DEFAULT_WEAPON_SCORE = 6.5
+
+_ARMOR_RE = re.compile(
+    r"^(?:[+-]\d+\s+)?([a-z ]+?)(?:\s+\[(?:protection\s+)?(-?\d+)\])?(?:\s+called\s+.+)?$",
+    re.IGNORECASE,
+)
+_WEARING_MSG_RE = re.compile(r"wearing\s+(.+)$", re.IGNORECASE)
+# Base Arm rating (10 - a_class, higher is better; extern.c).
+_ARMOR_BASE_VALUE: dict[str, int] = {
+    "leather armor": 2,
+    "ring mail": 3,
+    "studded leather armor": 3,
+    "scale mail": 4,
+    "chain mail": 5,
+    "splint mail": 6,
+    "banded mail": 6,
+    "plate mail": 7,
+}
+
+_KNOWN_POTION_RE = re.compile(
+    r"^(?:an?|(\d+))\s+potions?\s+of\s+([a-z ]+?)\(([a-z ]+)\)$",
+    re.IGNORECASE,
+)
+_UNKNOWN_POTION_RE = re.compile(
+    r"^(?:an?|(\d+))\s+([a-z ]+?)\s+potions?$",
+    re.IGNORECASE,
+)
+
+
+
 
 
 class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
@@ -129,6 +174,13 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._visit_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
         self._search_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
         self._has_food: bool = True
+        self._pack: dict[str, str] = {}
+        self._inventory_dirty: bool = False
+        self._weapon_score: float = _DEFAULT_WEAPON_SCORE
+        self._weapon_cursed: bool = False
+        self._armor_cursed: bool = False
+        self._tried_potion_colors: set[str] = set()
+        self._known_potion_colors: dict[str, str] = {}
         # How the current episode ended: None while it is running.
         self._end: Optional[str] = None
         self._killed_by: Optional[str] = None
@@ -148,6 +200,13 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._prev_pos = None
         self._tile_under_player = "."
         self._has_food = True
+        self._pack = {}
+        self._inventory_dirty = False
+        self._weapon_score = _DEFAULT_WEAPON_SCORE
+        self._weapon_cursed = False
+        self._armor_cursed = False
+        self._tried_potion_colors = set()
+        self._known_potion_colors = {}
         self._end = None
         self._killed_by = None
 
@@ -207,6 +266,11 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             stepped_tile = chr(int(self._last_screen[curr_pos[0], curr_pos[1]]))
             if stepped_tile in ("%", "#", "+"):
                 self._tile_under_player = stepped_tile
+            elif (stepped_tile in _ITEM_CHARS or stepped_tile == "*") and not messages:
+                # Under hallucination, an unseen staircase is drawn as a random
+                # item/gold glyph (daemons.c:260), so stepping onto it produces
+                # no pickup or "moved onto" message.
+                self._tile_under_player = "%"
             elif stepped_tile in _ITEM_CHARS and (
                 "moved onto" in msg_text or "no room" in msg_text
             ):
@@ -220,6 +284,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         # them, so watch every step's messages for food entering the pack.
         if _FOOD_PICKUP_RE.search(msg_text):
             self._has_food = True
+        if any(_PICKUP_RE.search(m) for m in messages):
+            self._inventory_dirty = True
 
         ate_food = False
         if (
@@ -236,6 +302,18 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 parsed_after_eat = parse_status(lines[23])
                 if parsed_after_eat is not None:
                     self._status = parsed_after_eat
+                curr_pos = find_player(lines)
+                screen_arr = screen_to_array(lines)
+
+        if self.client.alive and not is_death_or_end_screen(lines):
+            auto_msgs = self._run_auto_actions()
+            if auto_msgs:
+                messages.extend(auto_msgs)
+                lines = self.client.get_lines()
+                self._last_lines = lines
+                parsed_after_auto = parse_status(lines[23])
+                if parsed_after_auto is not None:
+                    self._status = parsed_after_auto
                 curr_pos = find_player(lines)
                 screen_arr = screen_to_array(lines)
 
@@ -372,6 +450,25 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         return ate, collected
 
     @staticmethod
+    def _overlay_items(lines: list[str], list_msgs: list[str]) -> dict[str, str]:
+        """Extract all 'x) description' pack items from an overlay or single-line message."""
+        items: dict[str, str] = {}
+        for row, line in enumerate(lines):
+            col = line.find(_OVERLAY_PROMPT)
+            if col == -1:
+                continue
+            for item_line in lines[:row]:
+                match = _ITEM_LINE_RE.match(item_line[col:])
+                if match:
+                    items[match.group(1)] = match.group(2)
+            return items
+        for m in list_msgs:
+            match = _ITEM_LINE_RE.match(m)
+            if match:
+                items[match.group(1)] = match.group(2)
+        return items
+
+    @staticmethod
     def _overlay_slot(lines: list[str]) -> Optional[str]:
         """Return the first pack letter listed in an inventory overlay, if any."""
         for row, line in enumerate(lines):
@@ -391,6 +488,259 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         if any(_OVERLAY_PROMPT in line for line in self.client.get_lines()):
             return self.client.send_key(" ")
         return []
+
+    def _refresh_inventory(self) -> list[str]:
+        """Query the full pack with 'i' (zero game turns) and update cached pack state."""
+        collected: list[str] = []
+        inv_msgs = self.client.send_key("i")
+        collected.extend(inv_msgs)
+        self._pack = self._overlay_items(self.client.get_lines(), inv_msgs)
+        collected.extend(self._dismiss_overlay())
+        self._inventory_dirty = False
+        for desc in self._pack.values():
+            if desc.endswith("(weapon in hand)"):
+                score = self._weapon_value(desc)
+                if score is not None:
+                    self._weapon_score = score
+        return collected
+
+    @staticmethod
+    def _weapon_value(desc: str) -> Optional[float]:
+        """Score a melee weapon description (higher is better), or None if not a melee weapon."""
+        clean = desc
+        if clean.endswith("(weapon in hand)"):
+            clean = clean[: -len("(weapon in hand)")].strip()
+        match = _WEAPON_BONUS_RE.match(clean)
+        if not match:
+            return None
+        hplus_s, dplus_s, name = match.group(1), match.group(2), match.group(3).lower()
+        base = _WEAPON_BASE_DAMAGE.get(name)
+        if base is None:
+            return None
+        hplus = int(hplus_s) if hplus_s is not None else 0
+        dplus = int(dplus_s) if dplus_s is not None else 0
+        return base + 0.5 * hplus + dplus
+
+    @staticmethod
+    def _armor_value(desc: str) -> Optional[int]:
+        """Score an armor description on the Arm scale (10 - AC, higher is better), or None."""
+        clean = desc
+        if clean.endswith("(being worn)"):
+            clean = clean[: -len("(being worn)")].strip()
+        match = _ARMOR_RE.match(clean)
+        if not match:
+            return None
+        name = match.group(1).strip().lower()
+        base = _ARMOR_BASE_VALUE.get(name)
+        if base is None:
+            return None
+        bracket = match.group(2)
+        return int(bracket) if bracket is not None else base
+
+    def _parse_potion(self, desc: str) -> Optional[tuple[int, Optional[str], str]]:
+        """Parse a potion pack entry into (count, kind_or_None, color), or None."""
+        m_known = _KNOWN_POTION_RE.match(desc.strip())
+        if m_known:
+            count = int(m_known.group(1)) if m_known.group(1) else 1
+            kind = m_known.group(2).strip().lower()
+            color = m_known.group(3).strip().lower()
+            self._tried_potion_colors.add(color)
+            self._known_potion_colors[color] = kind
+            return count, kind, color
+        m_unk = _UNKNOWN_POTION_RE.match(desc.strip())
+        if m_unk:
+            count = int(m_unk.group(1)) if m_unk.group(1) else 1
+            color = m_unk.group(2).strip().lower()
+            return count, self._known_potion_colors.get(color), color
+        return None
+
+    def _quaff_slot(self, slot: str, count: int, color: str) -> list[str]:
+        """Quaff one potion from `slot`, dismiss any 'call it:' prompt, and update `_pack`."""
+        collected: list[str] = []
+        collected.extend(self.client.send_key("q"))
+        quaff_msgs = self.client.send_key(slot)
+        collected.extend(quaff_msgs)
+        self._tried_potion_colors.add(color)
+
+        qtext = " ".join(quaff_msgs).lower()
+        inferred: Optional[str] = None
+        if "begin to feel much better" in qtext:
+            inferred = "extra healing"
+        elif "begin to feel better" in qtext:
+            inferred = "healing"
+        elif "what bulging muscles" in qtext:
+            inferred = "gain strength"
+        elif "much more skillful" in qtext:
+            inferred = "raise level"
+        elif "feel warm all over" in qtext:
+            inferred = "restore strength"
+        if inferred is not None:
+            self._known_potion_colors[color] = inferred
+
+        top = self.client.get_lines()[0].lower()
+        if "call it" in top or "quaff what" in top:
+            collected.extend(self.client.send_key("\x1b"))
+
+        if count <= 1:
+            self._pack.pop(slot, None)
+        else:
+            rem = count - 1
+            kind = self._known_potion_colors.get(color)
+            if kind is not None:
+                prefix = "A potion" if rem == 1 else f"{rem} potions"
+                self._pack[slot] = f"{prefix} of {kind}({color})"
+            else:
+                prefix = "A" if rem == 1 else str(rem)
+                noun = "potion" if rem == 1 else "potions"
+                self._pack[slot] = f"{prefix} {color} {noun}"
+        return collected
+
+    def _try_heal_quaff(self) -> list[str]:
+        """Drink a known healing potion when below 25% health (even in combat)."""
+        if self._status.hp <= 0 or self._status.hp >= 0.25 * max(1, self._status.max_hp):
+            return []
+        collected: list[str] = []
+        if self._inventory_dirty:
+            collected.extend(self._refresh_inventory())
+        for target_kind in ("extra healing", "healing"):
+            for slot, desc in list(self._pack.items()):
+                parsed = self._parse_potion(desc)
+                if parsed is None:
+                    continue
+                count, kind, color = parsed
+                if kind == target_kind:
+                    collected.extend(self._quaff_slot(slot, count, color))
+                    return collected
+        return collected
+
+    def _try_safe_quaff(self) -> list[str]:
+        """Drink known buff potions or (at full health) unknown potions when no monster is in view."""
+        for slot, desc in list(self._pack.items()):
+            parsed = self._parse_potion(desc)
+            if parsed is None:
+                continue
+            count, kind, color = parsed
+            if kind in ("gain strength", "raise level"):
+                return self._quaff_slot(slot, count, color)
+            if (
+                kind == "restore strength"
+                and self._status.strength < self._status.max_strength
+            ):
+                return self._quaff_slot(slot, count, color)
+            if (
+                kind is None
+                and color not in self._tried_potion_colors
+                and self._status.hp >= self._status.max_hp
+            ):
+                return self._quaff_slot(slot, count, color)
+        return []
+
+    @staticmethod
+    def _monster_in_view(lines: list[str]) -> bool:
+        """True if any monster letter ('A'..'Z') is visible on the dungeon map."""
+        return any("A" <= ch <= "Z" for row in lines[1:23] for ch in row)
+
+    def _run_auto_actions(self) -> list[str]:
+        """Run scripted inventory refresh and auto-equip/quaff actions."""
+        collected: list[str] = []
+        collected.extend(self._try_heal_quaff())
+        if self._monster_in_view(self.client.get_lines()):
+            return collected
+        if self._inventory_dirty:
+            collected.extend(self._refresh_inventory())
+        collected.extend(self._try_auto_wield())
+        collected.extend(self._try_auto_wear())
+        collected.extend(self._try_safe_quaff())
+        return collected
+
+    def _try_auto_wear(self) -> list[str]:
+        """Wear the best armor in the pack if it strictly beats the worn armor."""
+        if self._armor_cursed:
+            return []
+        worn_slot: Optional[str] = None
+        current_score = self._status.armor
+        for slot, desc in self._pack.items():
+            if desc.endswith("(being worn)"):
+                worn_slot = slot
+                score = self._armor_value(desc)
+                if score is not None:
+                    current_score = score
+                break
+
+        best_slot: Optional[str] = None
+        best_score = current_score
+        for slot, desc in self._pack.items():
+            if slot == worn_slot or desc.endswith("(being worn)"):
+                continue
+            score = self._armor_value(desc)
+            if score is not None and score > best_score:
+                best_score = score
+                best_slot = slot
+
+        if best_slot is None:
+            return []
+
+        collected: list[str] = []
+        if worn_slot is not None or self._status.armor > 0:
+            take_off_msgs = self.client.send_key("T")
+            collected.extend(take_off_msgs)
+            if "appears to be cursed" in " ".join(take_off_msgs).lower():
+                self._armor_cursed = True
+                return collected
+            if worn_slot is not None and worn_slot in self._pack:
+                d = self._pack[worn_slot]
+                if d.endswith("(being worn)"):
+                    self._pack[worn_slot] = d[: -len("(being worn)")].strip()
+
+        collected.extend(self.client.send_key("W"))
+        wear_msgs = self.client.send_key(best_slot)
+        collected.extend(wear_msgs)
+        for m in wear_msgs:
+            match = _WEARING_MSG_RE.search(m)
+            if match:
+                self._pack[best_slot] = f"{match.group(1).strip()} (being worn)"
+                break
+        if "wear what" in self.client.get_lines()[0].lower():
+            collected.extend(self.client.send_key("\x1b"))
+        return collected
+
+    def _try_auto_wield(self) -> list[str]:
+        """Wield the best melee weapon in the pack if it beats the current one."""
+        if self._weapon_cursed:
+            return []
+        best_slot: Optional[str] = None
+        best_score = self._weapon_score
+        for slot, desc in self._pack.items():
+            if desc.endswith("(weapon in hand)"):
+                continue
+            score = self._weapon_value(desc)
+            if score is not None and score > best_score:
+                best_score = score
+                best_slot = slot
+
+        if best_slot is None:
+            return []
+
+        collected: list[str] = []
+        w_msgs = self.client.send_key("w")
+        collected.extend(w_msgs)
+        if "appears to be cursed" in " ".join(w_msgs).lower():
+            self._weapon_cursed = True
+            return collected
+        wield_msgs = self.client.send_key(best_slot)
+        collected.extend(wield_msgs)
+        wield_text = " ".join(wield_msgs).lower()
+        if "appears to be cursed" in wield_text:
+            self._weapon_cursed = True
+        elif "wielding" in wield_text:
+            self._weapon_score = best_score
+            for s, d in list(self._pack.items()):
+                if d.endswith("(weapon in hand)"):
+                    self._pack[s] = d[: -len("(weapon in hand)")].strip()
+            self._pack[best_slot] = f"{self._pack[best_slot]} (weapon in hand)"
+        if "wield what" in self.client.get_lines()[0].lower():
+            collected.extend(self.client.send_key("\x1b"))
+        return collected
 
     @staticmethod
     def _is_attack(
