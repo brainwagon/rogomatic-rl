@@ -964,6 +964,97 @@ def test_rests_when_hurt_and_safe_and_escapes_down_stairs_when_monster_appears()
     assert list(np.flatnonzero(env._compute_action_mask(screen_to_array(with_monster), (5, 5)))) == [10]
 
 
+def test_missile_value_and_target_line_of_sight() -> None:
+    # 1. Ranking: shuriken (5.0) > spear (3.5) > dagger (2.5) > dart (2.0) > arrow (1.0)
+    assert RogueEnv._missile_value("12 shurikens") == (12, pytest.approx(5.0))
+    assert RogueEnv._missile_value("A +1,+2 spear") == (1, pytest.approx(3.5 + 0.5 + 2.0))
+    assert RogueEnv._missile_value("3 daggers") == (3, pytest.approx(2.5))
+    assert RogueEnv._missile_value("8 darts") == (8, pytest.approx(2.0))
+    assert RogueEnv._missile_value("25 +0,+0 arrows") == (25, pytest.approx(1.0))
+
+    # Wielded weapons, launchers, and pure melee weapons are never thrown.
+    assert RogueEnv._missile_value("A +1,+1 spear (weapon in hand)") is None
+    assert RogueEnv._missile_value("A +1,+0 short bow") is None
+    assert RogueEnv._missile_value("A +1,+1 mace") is None
+    assert RogueEnv._missile_value("A long sword") is None
+
+    # 2. Line of sight: nearest unobstructed monster at distance >= 2
+    lines = _blank_screen()
+    lines = _with(lines, 5, 4, ".@..H")  # H at (5, 8), dist 3 right ('l')
+    lines = _with(lines, 3, 5, ".")
+    lines = _with(lines, 4, 5, ".")
+    lines = _with(lines, 2, 5, "S")      # S at (2, 5), dist 3 up ('k')
+    lines = _with(lines, 7, 7, "B")      # B at (7, 7), dist 2 down-right ('n')
+    lines = _with(lines, 6, 6, ".")
+    assert RogueEnv._find_missile_target(screen_to_array(lines), (5, 5)) == "n"
+
+    # Blocked by doorway '+' or wall '|': returns None
+    blocked = _blank_screen()
+    blocked = _with(blocked, 5, 4, ".@+.H")
+    assert RogueEnv._find_missile_target(screen_to_array(blocked), (5, 5)) is None
+
+    # Monster adjacent (distance 1): returns None so player fights in melee
+    adj = _with(_room(), 5, 6, "H")
+    assert RogueEnv._find_missile_target(screen_to_array(adj), (5, 5)) is None
+
+
+def test_throws_best_missile_at_ranged_monster_and_updates_stack() -> None:
+    room = _blank_screen()
+    room = _with(room, 4, 4, ".....")
+    room = _with(room, 5, 4, ".@..H")
+    room = _with(room, 6, 4, ".....")
+    room = _with(room, 23, 0, _status_line())
+
+    throw_prompt = _with(room, 0, 0, "throw what? (* for list): ")
+    after_shuriken = _with(room, 0, 0, "the shuriken hits the hobgoblin")
+    after_arrow = _with(room, 0, 0, "the arrow hits the hobgoblin")
+
+    env = _fake_env(
+        {
+            ".": room,
+            "tl": throw_prompt,
+            "f": after_shuriken,
+            "e": after_arrow,
+        },
+        room,
+    )
+    env._last_pos = (5, 5)
+    env._status = parse_status(room[23]) or RogueStatus()
+    env._pack = {
+        "c": "A +1,+1 mace (weapon in hand)",
+        "d": "A +1,+0 short bow",
+        "e": "2 +0,+0 arrows",
+        "f": "A shuriken",
+    }
+
+    # Step 1: throws the single shuriken ('f') over the arrows ('e'), and removes 'f' from pack.
+    env.step(8)  # '.'
+    assert env.client.keys == [".", "tl", "f"]
+    assert "f" not in env._pack
+
+    # Step 2: now throws an arrow ('e') and decrements the stack from 2 to 1.
+    env.client.keys.clear()
+    env.step(8)  # '.'
+    assert env.client.keys == [".", "tl", "e"]
+    assert env._pack["e"] == "An +0,+0 arrow"
+
+
+def test_real_rogue_throws_starting_arrow_at_aligned_monster() -> None:
+    env = RogueEnv(max_steps=10, fixed_dungeons=True)
+    try:
+        # Dungeon 1007 starts with a bat aligned to the right of the player in the starting room.
+        env.reset(seed=1007)
+        assert env._pack.get("e") == "25 +0,+0 arrows"
+        _, _, terminated, _, info = env.step(8)  # '.'
+        assert terminated is False
+        assert any("arrow" in m.lower() for m in info["messages"])
+        assert env._pack.get("e") == "24 +0,+0 arrows"
+    finally:
+        env.close()
+
+
+
+
 
 
 

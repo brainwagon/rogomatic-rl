@@ -116,6 +116,27 @@ _UNKNOWN_POTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_MISSILE_RE = re.compile(
+    r"^(?:an?|(\d+))\s+((?:[+-]\d+,[+-]\d+\s+)?)(shuriken|spear|dagger|dart|arrow)s?(?:\s+called\s+.+)?$",
+    re.IGNORECASE,
+)
+_MISSILE_BONUS_RE = re.compile(r"^([+-]\d+),([+-]\d+)\s*$")
+# Mean thrown damage when wielding a melee weapon (init_dam in weapons.c, roll_em in fight.c).
+_MISSILE_BASE_DAMAGE: dict[str, float] = {
+    "shuriken": 5.0,  # 2d4
+    "spear": 3.5,     # 1d6
+    "dagger": 2.5,    # 1d4
+    "dart": 2.0,      # 1d3
+    "arrow": 1.0,     # 1d1 without short bow in hand
+}
+_DEFAULT_PACK: dict[str, str] = {
+    "a": "Some food",
+    "b": "+1 ring mail [4] (being worn)",
+    "c": "A +1,+1 mace (weapon in hand)",
+    "d": "A +1,+0 short bow",
+    "e": "25 +0,+0 arrows",
+}
+
 
 
 
@@ -203,7 +224,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._prev_pos = None
         self._tile_under_player = "."
         self._has_food = True
-        self._pack = {}
+        self._pack = dict(_DEFAULT_PACK)
         self._inventory_dirty = False
         self._weapon_score = _DEFAULT_WEAPON_SCORE
         self._weapon_cursed = False
@@ -658,15 +679,131 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         return []
 
     @staticmethod
+    def _missile_value(desc: str) -> Optional[tuple[int, float]]:
+        """Parse a throwable missile pack entry into (count, score), or None."""
+        clean = desc.strip()
+        if clean.endswith("(weapon in hand)") or clean.endswith("(being worn)"):
+            return None
+        match = _MISSILE_RE.match(clean)
+        if not match:
+            return None
+        count = int(match.group(1)) if match.group(1) else 1
+        bonus_str = match.group(2)
+        kind = match.group(3).lower()
+        base = _MISSILE_BASE_DAMAGE.get(kind)
+        if base is None:
+            return None
+        hplus = 0
+        dplus = 0
+        if bonus_str:
+            bmatch = _MISSILE_BONUS_RE.match(bonus_str)
+            if bmatch:
+                hplus = int(bmatch.group(1))
+                dplus = int(bmatch.group(2))
+        return count, base + 0.5 * hplus + dplus
+
+    @staticmethod
+    def _find_missile_target(
+        screen_arr: np.ndarray, player_pos: Optional[tuple[int, int]]
+    ) -> Optional[str]:
+        """Return the direction key toward the nearest unobstructed aligned monster at dist >= 2."""
+        if player_pos is None:
+            return None
+        pr, pc = player_pos
+        for dr, dc in _MOVE_DELTAS:
+            nr, nc = pr + dr, pc + dc
+            if 1 <= nr <= 22 and 0 <= nc < 80:
+                if "A" <= chr(int(screen_arr[nr, nc])) <= "Z":
+                    return None
+
+        best_dist: Optional[int] = None
+        best_dir: Optional[str] = None
+        for idx, (dr, dc) in enumerate(_MOVE_DELTAS):
+            k = 1
+            while True:
+                nr, nc = pr + k * dr, pc + k * dc
+                if not (1 <= nr <= 22 and 0 <= nc < 80):
+                    break
+                ch = chr(int(screen_arr[nr, nc]))
+                if ch in _WALL_CHARS or ch == "+":
+                    break
+                if "A" <= ch <= "Z":
+                    if k >= 2 and (best_dist is None or k < best_dist):
+                        best_dist = k
+                        best_dir = ACTIONS[idx]
+                    break
+                k += 1
+        return best_dir
+
+    def _try_throw_missile(self) -> list[str]:
+        """Throw the highest-scored missile at an aligned monster at range >= 2."""
+        lines = self.client.get_lines()
+        player_pos = find_player(lines)
+        screen_arr = screen_to_array(lines)
+        erased_floor = (screen_arr[1:23] == ord(" ")) & self._seen_floor_mask
+        screen_arr[1:23][erased_floor] = ord(".")
+        dir_key = self._find_missile_target(screen_arr, player_pos)
+        if dir_key is None:
+            return []
+
+        collected: list[str] = []
+        if self._inventory_dirty:
+            collected.extend(self._refresh_inventory())
+
+        best_slot: Optional[str] = None
+        best_count: int = 0
+        best_score: float = -1e9
+        for slot, desc in self._pack.items():
+            parsed = self._missile_value(desc)
+            if parsed is None:
+                continue
+            count, score = parsed
+            if score > best_score:
+                best_score = score
+                best_slot = slot
+                best_count = count
+
+        if best_slot is None:
+            return collected
+
+        desc = self._pack[best_slot]
+        collected.extend(self.client.send_key(f"t{dir_key}"))
+        throw_msgs = self.client.send_key(best_slot)
+        collected.extend(throw_msgs)
+        top = self.client.get_lines()[0].lower()
+        if "throw what" in top or "direction" in top:
+            collected.extend(self.client.send_key("\x1b"))
+            self._pack.pop(best_slot, None)
+            return collected
+
+        if best_count <= 1:
+            self._pack.pop(best_slot, None)
+        else:
+            rem = best_count - 1
+            match = _MISSILE_RE.match(desc.strip())
+            if match:
+                bonus_part = match.group(2) or ""
+                kind = match.group(3).lower()
+                if rem == 1:
+                    article = "An" if kind[0] in "aeiou" else "A"
+                    self._pack[best_slot] = f"{article} {bonus_part}{kind}"
+                else:
+                    self._pack[best_slot] = f"{rem} {bonus_part}{kind}s"
+            else:
+                self._pack.pop(best_slot, None)
+        return collected
+
+    @staticmethod
     def _monster_in_view(lines: list[str]) -> bool:
         """True if any monster letter ('A'..'Z') is visible on the dungeon map."""
         return any("A" <= ch <= "Z" for row in lines[1:23] for ch in row)
 
     def _run_auto_actions(self) -> list[str]:
-        """Run scripted inventory refresh and auto-equip/quaff actions."""
+        """Run scripted inventory refresh and auto-equip/quaff/missile actions."""
         collected: list[str] = []
         collected.extend(self._try_heal_quaff())
         if self._monster_in_view(self.client.get_lines()):
+            collected.extend(self._try_throw_missile())
             return collected
         if self._inventory_dirty:
             collected.extend(self._refresh_inventory())
