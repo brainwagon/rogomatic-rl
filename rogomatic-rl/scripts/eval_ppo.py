@@ -76,7 +76,9 @@ def _watch(agent: RogueActorCritic, args: argparse.Namespace) -> list[EpisodeRec
                     )
                 obs, reward, terminated, truncated, info = env.step(int(action.item()))
                 total_reward += reward
-                if args.delay > 0:
+                if terminated:
+                    time.sleep(1.0)
+                elif args.delay > 0:
                     time.sleep(args.delay)
 
             records.append(EpisodeRecord.from_info(info, ret=total_reward, seed=seed))

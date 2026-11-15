@@ -1053,6 +1053,131 @@ def test_real_rogue_throws_starting_arrow_at_aligned_monster() -> None:
         env.close()
 
 
+def test_ring_value_parses_known_unknown_and_worn_rings() -> None:
+    env = _fake_env({}, _blank_screen())
+    env._status = RogueStatus()
+
+    # 1. Known non-numeric beneficial rings
+    assert env._ring_value("A ring of regeneration(ruby)") == (
+        "regeneration",
+        "ruby",
+        None,
+        pytest.approx(10.0),
+    )
+    assert env._ring_value("A ring of slow digestion(opal) (on left hand)") == (
+        "slow digestion",
+        "opal",
+        "left",
+        pytest.approx(9.0),
+    )
+    assert env._ring_value("A ring of searching(agate) (on right hand)") == (
+        "searching",
+        "agate",
+        "right",
+        pytest.approx(2.5),
+    )
+
+    # 2. Known numeric bonus rings (+1, +2, and cursed -1)
+    kind, stone, hand, score_p2 = env._ring_value("A ring of increase damage [+2](sapphire)")
+    assert (kind, stone, hand) == ("increase damage", "sapphire", None)
+    assert score_p2 > 8.0
+
+    _, _, _, score_p1 = env._ring_value("A ring of protection [+1](agate)")
+    assert 6.0 <= score_p1 < score_p2
+
+    _, _, _, score_neg = env._ring_value("A ring of add strength [-1](onyx)")
+    assert score_neg < 0.0
+
+    # 3. Harmful or useless rings score < 0
+    for bad in (
+        "A ring of aggravate monster(granite)",
+        "A ring of teleportation(moonstone)",
+        "A ring of adornment(diamond)",
+    ):
+        assert env._ring_value(bad)[3] < 0.0
+
+    # 4. Unidentified stone rings score 0.5 when not hungry, 0.0 when hungry
+    assert env._ring_value("An agate ring") == ("unknown", "agate", None, pytest.approx(0.5))
+    env._status = RogueStatus(hungry_state=1)
+    assert env._ring_value("An agate ring") == ("unknown", "agate", None, pytest.approx(0.0))
+
+
+def test_auto_rings_puts_on_replaces_and_handles_cursed_and_starvation() -> None:
+    room = _with(_room(), 23, 0, _status_line(hp=12, max_hp=12, strength=16, max_strength=16))
+    put_on_prompt = _with(room, 0, 0, "put on what? (* for list): ")
+    hand_prompt = _with(room, 0, 0, "left hand or right hand? ")
+    wearing_f = _with(room, 0, 0, "you are now wearing An agate ring (f)")
+    wearing_g = _with(room, 0, 0, "you are now wearing A ring of protection [+1](ruby) (g)")
+    wearing_h = _with(room, 0, 0, "you are now wearing A ring of regeneration(opal) (h)")
+    remove_cursed = _with(room, 0, 0, "you can't.  It appears to be cursed")
+    removed_left = _with(room, 0, 0, "was wearing A ring of protection [+1](ruby)(g)")
+
+    env = _fake_env(
+        {
+            ".": room,
+            "P": put_on_prompt,
+            "g": hand_prompt,
+            "l": wearing_g,
+            "f": wearing_f,
+            "R": hand_prompt,
+            "r": remove_cursed,
+            "h": wearing_h,
+        },
+        room,
+    )
+    env._last_pos = (5, 5)
+    env._status = parse_status(room[23]) or RogueStatus()
+    env._pack = {
+        "f": "An agate ring",
+        "g": "A ring of protection [+1](ruby)",
+    }
+
+    # 1. Both hands empty: puts on 'g' (left hand, prompts 'l') then 'f' (right hand, no prompt).
+    env.step(8)
+    assert env.client.keys == [".", "P", "g", "l", "P", "f"]
+    assert env._pack["g"].endswith("(on left hand)")
+    assert env._pack["f"].endswith("(on right hand)")
+
+    # 2. Add a superior ring 'h' (regeneration) while 'f' on right hand is cursed:
+    # tries to remove weaker 'f' ('R' -> 'r') -> cursed! Falls back to removing 'g' ('R' -> 'l')
+    # and puts 'h' on left hand.
+    env._pack["h"] = "A ring of regeneration(opal)"
+    env.client._screens["l"] = removed_left
+    env.client.keys.clear()
+    env.step(8)
+    assert env.client.keys == [".", "R", "r", "R", "l", "P", "h"]
+    assert env._ring_cursed["right"] is True
+    assert env._pack["h"].endswith("(on left hand)")
+    assert not env._pack["g"].endswith("(on left hand)")
+
+    # 3. Starvation guard: when hungry with no food, removes uncursed non-digest/regen rings.
+    env._pack["g"] = "A ring of protection [+1](ruby) (on left hand)"
+    env._pack.pop("h", None)
+    hungry_room = _with(_room(), 23, 0, _status_line() + "  Hungry")
+    env.client._screens["."] = hungry_room
+    env._has_food = False
+    env.client.keys.clear()
+    env.step(8)
+    assert "R" in env.client.keys
+    assert not env._pack["g"].endswith("(on left hand)")
+
+
+def test_real_rogue_picks_up_and_puts_on_ring() -> None:
+    env = RogueEnv(max_steps=15, fixed_dungeons=True)
+    try:
+        # Dungeon 1119 has a ring '=' at (12, 39) with player starting at (13, 43).
+        env.reset(seed=1119)
+        for move in (0, 0, 0, 4):  # 'h', 'h', 'h', 'y' onto (12, 39)
+            env.step(move)
+        assert any(
+            "(on left hand)" in desc or "(on right hand)" in desc
+            for desc in env._pack.values()
+        )
+    finally:
+        env.close()
+
+
+
 
 
 

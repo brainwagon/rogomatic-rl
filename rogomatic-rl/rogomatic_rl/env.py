@@ -116,6 +116,33 @@ _UNKNOWN_POTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_KNOWN_RING_RE = re.compile(
+    r"^(?:an?|(\d+))\s+rings?\s+of\s+([a-z ]+?)(?:\s+\[([+-]?\d+)\])?\(([a-z ]+)\)$",
+    re.IGNORECASE,
+)
+_UNKNOWN_RING_RE = re.compile(
+    r"^(?:an?|(\d+))\s+([a-z ]+?)\s+rings?$",
+    re.IGNORECASE,
+)
+_RING_BASE_SCORE: dict[str, float] = {
+    "regeneration": 10.0,
+    "slow digestion": 9.0,
+    "maintain armor": 4.5,
+    "sustain strength": 4.0,
+    "see invisible": 3.5,
+    "stealth": 3.0,
+    "searching": 2.5,
+    "adornment": -5.0,
+    "aggravate monster": -5.0,
+    "teleportation": -5.0,
+}
+_NUMERIC_RING_TIEBREAK: dict[str, float] = {
+    "increase damage": 0.3,
+    "dexterity": 0.2,
+    "protection": 0.1,
+    "add strength": 0.0,
+}
+
 _MISSILE_RE = re.compile(
     r"^(?:an?|(\d+))\s+((?:[+-]\d+,[+-]\d+\s+)?)(shuriken|spear|dagger|dart|arrow)s?(?:\s+called\s+.+)?$",
     re.IGNORECASE,
@@ -202,6 +229,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._weapon_score: float = _DEFAULT_WEAPON_SCORE
         self._weapon_cursed: bool = False
         self._armor_cursed: bool = False
+        self._ring_cursed: dict[str, bool] = {"left": False, "right": False}
+        self._known_ring_stones: dict[str, tuple[str, Optional[int]]] = {}
         self._tried_potion_colors: set[str] = set()
         self._known_potion_colors: dict[str, str] = {}
         # How the current episode ended: None while it is running.
@@ -229,6 +258,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._weapon_score = _DEFAULT_WEAPON_SCORE
         self._weapon_cursed = False
         self._armor_cursed = False
+        self._ring_cursed = {"left": False, "right": False}
+        self._known_ring_stones = {}
         self._tried_potion_colors = set()
         self._known_potion_colors = {}
         self._end = None
@@ -799,7 +830,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         return any("A" <= ch <= "Z" for row in lines[1:23] for ch in row)
 
     def _run_auto_actions(self) -> list[str]:
-        """Run scripted inventory refresh and auto-equip/quaff/missile actions."""
+        """Run scripted inventory refresh and auto-equip/quaff/missile/ring actions."""
         collected: list[str] = []
         collected.extend(self._try_heal_quaff())
         if self._monster_in_view(self.client.get_lines()):
@@ -809,7 +840,214 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             collected.extend(self._refresh_inventory())
         collected.extend(self._try_auto_wield())
         collected.extend(self._try_auto_wear())
+        collected.extend(self._try_auto_rings())
         collected.extend(self._try_safe_quaff())
+        return collected
+
+    def _ring_value(
+        self, desc: str
+    ) -> Optional[tuple[str, str, Optional[str], float]]:
+        """Parse a ring pack entry into (kind, stone, hand, score), or None."""
+        clean = desc.strip()
+        hand: Optional[str] = None
+        if clean.endswith("(on left hand)"):
+            hand = "left"
+            clean = clean[: -len("(on left hand)")].strip()
+        elif clean.endswith("(on right hand)"):
+            hand = "right"
+            clean = clean[: -len("(on right hand)")].strip()
+        elif clean.endswith("(being worn)") or clean.endswith("(weapon in hand)"):
+            return None
+
+        bonus: Optional[int] = None
+        match = _KNOWN_RING_RE.match(clean)
+        if match:
+            kind = match.group(2).strip().lower()
+            if match.group(3) is not None:
+                bonus = int(match.group(3))
+            stone = match.group(4).strip().lower()
+        else:
+            umatch = _UNKNOWN_RING_RE.match(clean)
+            if not umatch:
+                return None
+            stone = umatch.group(2).strip().lower()
+            known = self._known_ring_stones.get(stone)
+            if known is not None:
+                kind, bonus = known
+            else:
+                kind = "unknown"
+
+        if kind == "unknown":
+            score = 0.5 if self._status.hungry_state == 0 else 0.0
+        elif kind in _NUMERIC_RING_TIEBREAK:
+            if bonus is not None:
+                if bonus <= 0:
+                    score = -5.0
+                else:
+                    score = 4.0 + 2.0 * bonus + _NUMERIC_RING_TIEBREAK[kind]
+            else:
+                score = 5.0 + _NUMERIC_RING_TIEBREAK[kind]
+        else:
+            score = _RING_BASE_SCORE.get(kind, 0.0)
+        return kind, stone, hand, score
+
+    def _remove_ring(
+        self, hand: str, slot: str, both_worn: bool
+    ) -> tuple[bool, list[str]]:
+        """Attempt to remove the ring on `hand`; returns (removed, messages)."""
+        collected: list[str] = []
+        r_msgs = self.client.send_key("R")
+        collected.extend(r_msgs)
+        top = self.client.get_lines()[0].lower()
+        if both_worn or "or right" in top:
+            hand_msgs = self.client.send_key("l" if hand == "left" else "r")
+            collected.extend(hand_msgs)
+            msg_text = " ".join(hand_msgs).lower()
+        else:
+            msg_text = " ".join(r_msgs).lower()
+
+        if "appears to be cursed" in msg_text:
+            self._ring_cursed[hand] = True
+            return False, collected
+
+        if slot in self._pack:
+            suffix = f"(on {hand} hand)"
+            d = self._pack[slot]
+            if d.endswith(suffix):
+                self._pack[slot] = d[: -len(suffix)].strip()
+        return True, collected
+
+    def _put_on_ring(
+        self, slot: str, stone: str, target_hand: str, both_empty: bool
+    ) -> tuple[bool, list[str]]:
+        """Put the ring in `slot` onto `target_hand`; returns (put_on, messages)."""
+        prev_str = self._status.strength
+        collected: list[str] = []
+        collected.extend(self.client.send_key("P"))
+        slot_msgs = self.client.send_key(slot)
+        collected.extend(slot_msgs)
+        top = self.client.get_lines()[0].lower()
+        if both_empty or "or right" in top:
+            hand_msgs = self.client.send_key("l" if target_hand == "left" else "r")
+            collected.extend(hand_msgs)
+            wear_text = " ".join(hand_msgs).lower()
+        else:
+            wear_text = " ".join(slot_msgs).lower()
+
+        top_after = self.client.get_lines()[0].lower()
+        if "put on what" in top_after or "or right" in top_after:
+            collected.extend(self.client.send_key("\x1b"))
+            return False, collected
+
+        if (
+            "wearing" not in wear_text
+            and "(on left hand)" not in wear_text
+            and "(on right hand)" not in wear_text
+            and not slot_msgs
+            and not both_empty
+        ):
+            return False, collected
+
+        if slot in self._pack:
+            base = self._pack[slot]
+            for suf in ("(on left hand)", "(on right hand)"):
+                if base.endswith(suf):
+                    base = base[: -len(suf)].strip()
+            self._pack[slot] = f"{base} (on {target_hand} hand)"
+
+        parsed_after = parse_status(self.client.get_lines()[23])
+        if parsed_after is not None:
+            delta = parsed_after.strength - prev_str
+            self._status = parsed_after
+            if delta != 0:
+                self._known_ring_stones[stone] = ("add strength", delta)
+                if delta < 0:
+                    self._ring_cursed[target_hand] = True
+        return True, collected
+
+    def _try_auto_rings(self) -> list[str]:
+        """Manage putting on, upgrading, and removing rings out of combat."""
+        collected: list[str] = []
+        starving = self._status.hungry_state >= 1 and not self._has_food
+
+        # 1. Remove any worn uncursed rings that are harmful (< 0) or draining food when starving.
+        for hand in ("left", "right"):
+            if self._ring_cursed.get(hand, False):
+                continue
+            worn_items = {
+                parsed[2]: (slot, parsed[0], parsed[1], parsed[3])
+                for slot, desc in self._pack.items()
+                if (parsed := self._ring_value(desc)) is not None and parsed[2] is not None
+            }
+            if hand not in worn_items:
+                continue
+            slot, kind, _stone, score = worn_items[hand]
+            should_remove = score < 0.0 or (
+                starving and kind not in ("slow digestion", "regeneration")
+            )
+            if should_remove:
+                _, msgs = self._remove_ring(hand, slot, both_worn=len(worn_items) == 2)
+                collected.extend(msgs)
+
+        # 2. Put on or upgrade rings from unworn candidates in descending score order.
+        while True:
+            worn: dict[str, tuple[str, str, str, float]] = {}
+            unworn: list[tuple[float, str, str, str]] = []
+            for slot, desc in self._pack.items():
+                parsed = self._ring_value(desc)
+                if parsed is None:
+                    continue
+                kind, stone, hand, score = parsed
+                if hand is not None:
+                    worn[hand] = (slot, kind, stone, score)
+                elif score > 0.0 and (
+                    not starving or kind in ("slow digestion", "regeneration")
+                ):
+                    unworn.append((score, slot, kind, stone))
+
+            if not unworn:
+                break
+            unworn.sort(key=lambda item: item[0], reverse=True)
+            cand_score, cand_slot, _cand_kind, cand_stone = unworn[0]
+
+            free_hands = [h for h in ("left", "right") if h not in worn]
+            if free_hands:
+                target_hand = free_hands[0]
+                ok, msgs = self._put_on_ring(
+                    cand_slot,
+                    cand_stone,
+                    target_hand,
+                    both_empty=len(free_hands) == 2,
+                )
+                collected.extend(msgs)
+                if not ok:
+                    break
+                continue
+
+            replaceable = [
+                (worn[h][3], h, worn[h][0])
+                for h in ("left", "right")
+                if h in worn and not self._ring_cursed.get(h, False)
+            ]
+            if not replaceable:
+                break
+            replaceable.sort(key=lambda item: item[0])
+            weak_score, weak_hand, weak_slot = replaceable[0]
+            if cand_score <= weak_score:
+                break
+
+            removed, r_msgs = self._remove_ring(weak_hand, weak_slot, both_worn=True)
+            collected.extend(r_msgs)
+            if not removed:
+                continue
+
+            ok, p_msgs = self._put_on_ring(
+                cand_slot, cand_stone, weak_hand, both_empty=False
+            )
+            collected.extend(p_msgs)
+            if not ok:
+                break
+
         return collected
 
     def _try_auto_wear(self) -> list[str]:
