@@ -267,6 +267,10 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._armor_cursed: bool = False
         self._ring_cursed: dict[str, bool] = {"left": False, "right": False}
         self._known_ring_stones: dict[str, tuple[str, Optional[int]]] = {}
+        # Stones of unidentified rings found cursed (so harmful) or found
+        # removable (so safe). Rogue never names a ring when it is worn.
+        self._bad_ring_stones: set[str] = set()
+        self._safe_ring_stones: set[str] = set()
         self._tried_potion_colors: set[str] = set()
         self._known_potion_colors: dict[str, str] = {}
         self._tried_scroll_keys: set[str] = set()
@@ -298,6 +302,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._armor_cursed = False
         self._ring_cursed = {"left": False, "right": False}
         self._known_ring_stones = {}
+        self._bad_ring_stones = set()
+        self._safe_ring_stones = set()
         self._tried_potion_colors = set()
         self._known_potion_colors = {}
         self._tried_scroll_keys = set()
@@ -1129,7 +1135,18 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 kind = "unknown"
 
         if kind == "unknown":
-            score = 0.5 if self._status.hungry_state == 0 else 0.0
+            # About a quarter of rings are cursed and cannot be taken off
+            # (aggravate monster, teleportation, and a third of the numeric
+            # ones), so an unidentified ring is worn only with a remove curse
+            # scroll in the pack, or once its stone is known to be removable.
+            if stone in self._bad_ring_stones:
+                score = -5.0
+            elif self._status.hungry_state != 0:
+                score = 0.0
+            elif stone in self._safe_ring_stones or self._has_remove_curse():
+                score = 0.5
+            else:
+                score = 0.0
         elif kind in _NUMERIC_RING_TIEBREAK:
             if bonus is not None:
                 if bonus <= 0:
@@ -1141,6 +1158,22 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         else:
             score = _RING_BASE_SCORE.get(kind, 0.0)
         return kind, stone, hand, score
+
+    def _has_remove_curse(self) -> bool:
+        """True if the pack holds a known scroll of remove curse."""
+        for desc in self._pack.values():
+            scroll = self._parse_scroll(desc)
+            if scroll is not None and scroll[1] == "remove curse":
+                return True
+        return False
+
+    def _worn_ring_stone(self, hand: str) -> Optional[str]:
+        """The stone of the ring on `hand`, from the pack, or None."""
+        for desc in self._pack.values():
+            parsed = self._ring_value(desc)
+            if parsed is not None and parsed[2] == hand:
+                return parsed[1]
+        return None
 
     def _remove_ring(
         self, hand: str, slot: str, both_worn: bool
@@ -1159,6 +1192,10 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
 
         if "appears to be cursed" in msg_text:
             self._ring_cursed[hand] = True
+            # Only harmful rings are cursed, so remember the stone as bad.
+            stone = self._worn_ring_stone(hand)
+            if stone is not None:
+                self._bad_ring_stones.add(stone)
             return False, collected
 
         if slot in self._pack:
@@ -1215,6 +1252,24 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 if delta < 0:
                     self._ring_cursed[target_hand] = True
         return True, collected
+
+    def _probe_ring(self, hand: str, slot: str, stone: str) -> list[str]:
+        """Learn whether a freshly worn unidentified ring is cursed by trying to take it off.
+
+        Rogue never names a ring when it is worn, but it refuses to remove a
+        cursed one. A removable ring is harmless, so its stone is marked safe
+        and the ring goes back on; a cursed one is marked bad and, with the
+        hand flagged, a remove curse scroll can free it.
+        """
+        both_worn = sum(
+            1
+            for desc in self._pack.values()
+            if (parsed := self._ring_value(desc)) is not None and parsed[2] is not None
+        ) >= 2
+        removed, msgs = self._remove_ring(hand, slot, both_worn=both_worn)
+        if removed:
+            self._safe_ring_stones.add(stone)
+        return msgs
 
     def _try_auto_rings(self) -> list[str]:
         """Manage putting on, upgrading, and removing rings out of combat."""
@@ -1273,6 +1328,12 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 collected.extend(msgs)
                 if not ok:
                     break
+                if (
+                    _cand_kind == "unknown"
+                    and cand_stone not in self._known_ring_stones
+                    and cand_stone not in self._safe_ring_stones
+                ):
+                    collected.extend(self._probe_ring(target_hand, cand_slot, cand_stone))
                 continue
 
             replaceable = [
@@ -1298,6 +1359,12 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             collected.extend(p_msgs)
             if not ok:
                 break
+            if (
+                _cand_kind == "unknown"
+                and cand_stone not in self._known_ring_stones
+                and cand_stone not in self._safe_ring_stones
+            ):
+                collected.extend(self._probe_ring(weak_hand, cand_slot, cand_stone))
 
         return collected
 

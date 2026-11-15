@@ -11,6 +11,8 @@ from gymnasium.utils.env_checker import check_env
 
 from rogomatic_rl import ACTIONS, RogueEnv
 from rogomatic_rl.env import (
+    _NUMERIC_RING_TIEBREAK,
+    _RING_BASE_SCORE,
     REWARD_DEATH,
     REWARD_DESCENT,
     REWARD_EXP_LEVEL,
@@ -1101,10 +1103,42 @@ def test_ring_value_parses_known_unknown_and_worn_rings() -> None:
     ):
         assert env._ring_value(bad)[3] < 0.0
 
-    # 4. Unidentified stone rings score 0.5 when not hungry, 0.0 when hungry
-    assert env._ring_value("An agate ring") == ("unknown", "agate", None, pytest.approx(0.5))
-    env._status = RogueStatus(hungry_state=1)
+    # 4. About a quarter of rings are cursed, so an unidentified ring scores 0
+    # (never worn) unless a remove curse scroll is in the pack or its stone is
+    # known removable; stones known cursed score below zero.
     assert env._ring_value("An agate ring") == ("unknown", "agate", None, pytest.approx(0.0))
+    env._pack = {"s": "A scroll of remove curse"}
+    assert env._ring_value("An agate ring") == ("unknown", "agate", None, pytest.approx(0.5))
+    env._pack = {"s": "A scroll titled 'abc'"}
+    assert env._ring_value("An agate ring")[3] == pytest.approx(0.0)
+    env._pack = {}
+    env._safe_ring_stones.add("agate")
+    assert env._ring_value("An agate ring")[3] == pytest.approx(0.5)
+    env._bad_ring_stones.add("agate")
+    assert env._ring_value("An agate ring")[3] < 0.0
+    env._bad_ring_stones.clear()
+    env._status = RogueStatus(hungry_state=1)
+    assert env._ring_value("An agate ring")[3] == pytest.approx(0.0)
+
+
+def test_every_rogue_ring_kind_has_a_score() -> None:
+    # The 14 kinds in ring_info (extern.c). A kind missing from the score
+    # tables would silently score 0 and never be worn.
+    kinds = [
+        "protection", "add strength", "sustain strength", "searching",
+        "see invisible", "adornment", "aggravate monster", "dexterity",
+        "increase damage", "regeneration", "slow digestion", "teleportation",
+        "stealth", "maintain armor",
+    ]  # fmt: skip
+    env = _fake_env({}, _blank_screen())
+    env._status = RogueStatus()
+    for kind in kinds:
+        known = kind in ("protection", "add strength", "dexterity", "increase damage")
+        desc = f"A ring of {kind} [+1](jade)" if known else f"A ring of {kind}(jade)"
+        parsed = env._ring_value(desc)
+        assert parsed is not None and parsed[0] == kind, kind
+        in_tables = kind in _RING_BASE_SCORE or kind in _NUMERIC_RING_TIEBREAK
+        assert in_tables, kind
 
 
 def test_auto_rings_puts_on_replaces_and_handles_cursed_and_starvation() -> None:
@@ -1132,6 +1166,7 @@ def test_auto_rings_puts_on_replaces_and_handles_cursed_and_starvation() -> None
     )
     env._last_pos = (5, 5)
     env._status = parse_status(room[23]) or RogueStatus()
+    env._safe_ring_stones.add("agate")  # known removable: no probe in this flow
     env._pack = {
         "f": "An agate ring",
         "g": "A ring of protection [+1](ruby)",
@@ -1167,34 +1202,117 @@ def test_auto_rings_puts_on_replaces_and_handles_cursed_and_starvation() -> None
     assert not env._pack["g"].endswith("(on left hand)")
 
 
-def test_real_rogue_picks_up_and_puts_on_ring() -> None:
+def _ring_probe_env() -> tuple[RogueEnv, list[str]]:
+    """Fake env at (5, 5) holding an unknown agate ring and a known remove curse scroll."""
+    room = _with(_room(), 23, 0, _status_line())
+    wearing = _with(room, 0, 0, "An agate ring (on left hand) (f)")
+    removed = _with(room, 0, 0, "Was wearing an agate ring(f)")
+    cursed = _with(room, 0, 0, "you can't.  It appears to be cursed")
+    env = _fake_env(
+        {
+            ".": room,
+            "P": _with(room, 0, 0, "Put on what? (* for list): "),
+            "f": _with(room, 0, 0, "Left or right ring? "),
+            "l": wearing,
+            "R": cursed,
+        },
+        room,
+    )
+    env._last_pos = (5, 5)
+    env._status = parse_status(room[23]) or RogueStatus()
+    env._pack = {"f": "An agate ring", "s": "A scroll of remove curse"}
+    env.client._removed = removed  # type: ignore[attr-defined]
+    return env, room
+
+
+def test_unknown_ring_is_probed_and_a_cursed_one_is_freed_with_remove_curse() -> None:
+    env, room = _ring_probe_env()
+    env.client._screens["r"] = _with(room, 0, 0, "Read what? (* for list): ")
+    env.client._screens["s"] = _with(room, 0, 0, "you feel as if somebody is watching over you")
+
+    # Step 1: with remove curse in the pack the unknown ring goes on, 'R' finds
+    # it cursed (so its stone is bad), and the flagged hand makes the known
+    # scroll worth reading at once, which clears the flag.
+    env.step(8)
+    assert env.client.keys == [".", "P", "f", "l", "R", "r", "s"]
+    assert "agate" in env._bad_ring_stones
+    assert env._ring_cursed == {"left": False, "right": False}
+    assert env._pack["f"].endswith("(on left hand)")
+    assert "s" not in env._pack
+
+    # Step 2: the freed ring sits on a bad stone, so it is taken off.
+    env.client._screens["R"] = env.client._removed  # type: ignore[attr-defined]
+    env._inventory_dirty = False
+    env.client.keys.clear()
+    env.step(8)
+    assert env.client.keys == [".", "R"]
+    assert not env._pack["f"].endswith("(on left hand)")
+
+
+def test_unknown_ring_that_comes_off_is_marked_safe_and_worn_again() -> None:
+    env, _ = _ring_probe_env()
+    env.client._screens["R"] = env.client._removed  # type: ignore[attr-defined]
+
+    env.step(8)
+    assert env.client.keys == [".", "P", "f", "l", "R", "P", "f", "l"]
+    assert "agate" in env._safe_ring_stones
+    assert env._ring_cursed == {"left": False, "right": False}
+    assert env._pack["f"].endswith("(on left hand)")
+
+    # A known-safe stone is not probed again.
+    env.client.keys.clear()
+    env.step(8)
+    assert "R" not in env.client.keys
+
+
+def test_unknown_ring_is_left_in_the_pack_without_remove_curse() -> None:
+    env, _ = _ring_probe_env()
+    env._pack.pop("s")
+    env.step(8)
+    assert env.client.keys == ["."]
+    assert env._pack["f"] == "An agate ring"
+
+
+def test_real_rogue_rings_wait_for_remove_curse_then_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Dungeon 1119 has a ring '=' at (12, 39), the player starts at (13, 43).
+    # Without a remove curse scroll the ring is picked up but not worn.
     env = RogueEnv(max_steps=15, fixed_dungeons=True)
     try:
-        # Dungeon 1119 has a ring '=' at (12, 39) with player starting at (13, 43).
         env.reset(seed=1119)
         for move in (0, 0, 0, 4):  # 'h', 'h', 'h', 'y' onto (12, 39)
             env.step(move)
-        assert any(
-            "(on left hand)" in desc or "(on right hand)" in desc
-            for desc in env._pack.values()
-        )
+        assert env._pack["f"] == "An onyx ring"
+
+        # With the safety net it is worn. This one is a cursed ring of add
+        # strength [-1], seen as a strength drop, and Rogue refuses to remove it.
+        env.reset(seed=1119)
+        monkeypatch.setattr(env, "_has_remove_curse", lambda: True)
+        for move in (0, 0, 0, 4):
+            env.step(move)
+        assert env._pack["f"] == "An onyx ring (on left hand)"
+        assert env._status.strength == 15
+        assert env._ring_cursed["left"] is True
+        removed, msgs = env._remove_ring("left", "f", both_worn=False)
+        assert removed is False
+        assert any("cursed" in m.lower() for m in msgs)
+        assert "onyx" in env._bad_ring_stones
     finally:
         env.close()
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    # Dungeon 1290: a removable ring is probed with 'R', found safe, and re-worn.
+    env = RogueEnv(max_steps=15, fixed_dungeons=True)
+    try:
+        env.reset(seed=1290)
+        monkeypatch.setattr(env, "_has_remove_curse", lambda: True)
+        for move in (7, 3):  # 'n', 'l'
+            env.step(move)
+        assert env._pack["f"] == "An amethyst ring (on left hand)"
+        assert env._safe_ring_stones == {"amethyst"}
+        assert env._ring_cursed == {"left": False, "right": False}
+    finally:
+        env.close()
 
 
 def _scroll_env(
