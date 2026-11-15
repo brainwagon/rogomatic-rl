@@ -857,6 +857,117 @@ def test_stepping_onto_hallucinated_stairs_with_no_pickup_message_enables_descen
     assert obs["action_mask"][10] == 1  # '>' descend stairs is legal
 
 
+def test_pty_screen_preserves_corridor_tile_across_vt100_scroll_region() -> None:
+    from rogomatic_rl.pty_client import RoguePTYClient
+
+    client = RoguePTYClient()
+    # Player at (5, 41) with '#' below at (6, 41), cursor at (5, 41).
+    client.stream.feed("\x1b[6;42H@\x1b[7;42H#\x1b[6;42H")
+    # ncurses vt100 csr + reverse-index sequence emitted when stepping down to (6, 41)
+    # reveals the next vertical corridor tile at (7, 41) by scrolling rows 7..23 down.
+    client.stream.feed("\x1b7\x1b[7;23r\x1b8\r\x1b[1B\x1bM\x1b[1;24r\x1b[6;42H+\x1b[1B\x08@\x08")
+    lines = client.get_lines()
+
+    assert lines[5][41] == "+"
+    assert lines[6][41] == "@"
+    assert lines[7][41] == "#"
+
+
+def test_standing_on_stairs_masks_only_descend_and_visible_stairs_steers_toward_stairs() -> None:
+    # 1. Standing on '%' out of combat leaves '>' (action 10) as the only valid action.
+    on_stairs = _room()
+    env = _fake_env({}, on_stairs)
+    env._tile_under_player = "%"
+    mask_on_stairs = env._compute_action_mask(screen_to_array(on_stairs), (5, 5))
+    assert list(np.flatnonzero(mask_on_stairs)) == [10]
+
+    # 2. When '%' is visible across the room at (5, 8), even if (5, 6) was already visited
+    # and (5, 4) is unvisited, the action mask steers toward '%' instead of away from it.
+    lines = _blank_screen()
+    lines = _with(lines, 4, 4, ".....")
+    lines = _with(lines, 5, 4, ".@..%")
+    lines = _with(lines, 6, 4, ".....")
+    env2 = _fake_env({}, lines)
+    env2._visit_counts[4, 6] = 2  # (5, 6) toward '%' already visited twice
+    env2._visit_counts[3, 6] = 2  # (4, 6) already visited twice
+    env2._visit_counts[5, 6] = 2  # (6, 6) already visited twice
+    mask_toward_stairs = env2._compute_action_mask(screen_to_array(lines), (5, 5))
+    # Only moves that advance right toward (5, 8) ('l'=3, 'u'=5, 'n'=7) are allowed.
+    assert set(np.flatnonzero(mask_toward_stairs)).issubset({3, 5, 7})
+    assert mask_toward_stairs[0] == 0  # 'h' away from stairs is masked
+
+
+def test_dark_room_erased_floor_tiles_remain_walkable() -> None:
+    # Step 1: player at (5, 5) in a dark room sees 3x3 '.' floor around them.
+    step1 = _room()
+    step1 = _with(step1, 23, 0, _status_line(level=2))
+    # Step 2: player moves right to (5, 6); Rogue's erase_lamp turns column 4 back to ' '.
+    step2 = _blank_screen()
+    step2 = _with(step2, 4, 5, "...")
+    step2 = _with(step2, 5, 5, ".@.")
+    step2 = _with(step2, 6, 5, "...")
+    step2 = _with(step2, 23, 0, _status_line(level=2))
+
+    env = _fake_env({"l": step2}, step1)
+    env._status = parse_status(step1[23]) or RogueStatus()
+    env._last_pos = (5, 5)
+    env._seen_floor_mask |= screen_to_array(step1)[1:23] == ord(".")
+
+    obs, _, _, _, _ = env.step(3)  # 'l' to (5, 6)
+
+    # Column 4 (e.g. (4, 4)) was seen as '.' on step 1, so it stays '.' in obs["screen"]
+    # rather than reverting to ' ' (wall).
+    assert obs["screen"][4, 4] == ord(".")
+
+
+def test_failed_descend_clears_stairs_tile_and_corridor_dead_end_searches_before_uturn() -> None:
+    # 1. If '>' fails to descend (e.g. hallucinated '%' or levitation), _tile_under_player
+    # resets to '.' so the agent is not locked into repeating '>'.
+    room = _with(_room(), 0, 0, "I see no way down")
+    room = _with(room, 23, 0, _status_line(level=1))
+    env = _fake_env({">": room}, room)
+    env._last_pos = (5, 5)
+    env._tile_under_player = "%"
+    obs, _, _, _, _ = env.step(10)  # '>'
+    assert env._tile_under_player == "."
+    assert obs["action_mask"][10] == 0
+
+    # 2. At a corridor dead end ('#' at (5, 5) with only (5, 4) '#' behind), search ('s', 9)
+    # is the only action until the search cap (6) is reached, then U-turn ('h', 0) opens.
+    dead_end = _blank_screen()
+    dead_end = _with(dead_end, 5, 4, "#@")
+    dead_end = _with(dead_end, 23, 0, _status_line(level=2))
+    env2 = _fake_env({}, dead_end)
+    env2._tile_under_player = "#"
+    env2._prev_pos = (5, 4)
+    mask_before = env2._compute_action_mask(screen_to_array(dead_end), (5, 5))
+    assert list(np.flatnonzero(mask_before)) == [9]
+
+    env2._search_counts[4, 5] = 6
+    mask_after = env2._compute_action_mask(screen_to_array(dead_end), (5, 5))
+    assert list(np.flatnonzero(mask_after)) == [0]
+
+
+def test_rests_when_hurt_and_safe_and_escapes_down_stairs_when_monster_appears() -> None:
+    # 1. Below 60% HP with no monster in view and not hungry: masks only '.' (rest, 8).
+    safe_room = _with(_room(), 23, 0, _status_line(hp=5, max_hp=12))
+    env = _fake_env({}, safe_room)
+    env._status = parse_status(safe_room[23]) or RogueStatus()
+    assert list(np.flatnonzero(env._compute_action_mask(screen_to_array(safe_room), (5, 5)))) == [8]
+
+    # 2. Standing on '%' while hurt and safe rests (8) until full HP; if a monster appears,
+    # immediately descends ('>', 10) even if the monster is adjacent.
+    env._tile_under_player = "%"
+    assert list(np.flatnonzero(env._compute_action_mask(screen_to_array(safe_room), (5, 5)))) == [8]
+
+    with_monster = _with(safe_room, 5, 6, "H")
+    assert list(np.flatnonzero(env._compute_action_mask(screen_to_array(with_monster), (5, 5)))) == [10]
+
+
+
+
+
+
 
 
 

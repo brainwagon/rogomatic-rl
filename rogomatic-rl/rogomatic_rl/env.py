@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 import re
@@ -170,6 +171,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._prev_pos: Optional[tuple[int, int]] = None
         self._tile_under_player: str = "."
         self._seen_mask: np.ndarray = np.zeros((22, 80), dtype=bool)
+        self._seen_floor_mask: np.ndarray = np.zeros((22, 80), dtype=bool)
         self._visited_mask: np.ndarray = np.zeros((22, 80), dtype=bool)
         self._visit_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
         self._search_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
@@ -194,6 +196,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         super().reset(seed=seed)
         self._steps = 0
         self._seen_mask.fill(False)
+        self._seen_floor_mask.fill(False)
         self._visited_mask.fill(False)
         self._visit_counts.fill(0)
         self._search_counts.fill(0)
@@ -221,6 +224,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._last_pos = find_player(lines)
 
         screen_arr = screen_to_array(lines)
+        self._seen_floor_mask |= screen_arr[1:23] == ord(".")
         self._last_screen = screen_arr
         self._seen_mask |= screen_arr[1:23] != 32
         if self._last_pos is not None:
@@ -256,6 +260,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
 
         if self._status.level != prev_status.level:
             self._seen_mask.fill(False)
+            self._seen_floor_mask.fill(False)
             self._visited_mask.fill(False)
             self._visit_counts.fill(0)
             self._search_counts.fill(0)
@@ -264,8 +269,16 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         elif curr_pos is not None and curr_pos != prev_pos:
             self._prev_pos = prev_pos
             stepped_tile = chr(int(self._last_screen[curr_pos[0], curr_pos[1]]))
-            if stepped_tile in ("%", "#", "+"):
+            picked_up_or_stepped_item = (
+                any(_PICKUP_RE.search(m) for m in messages)
+                or "gold pieces" in msg_text
+                or "moved onto" in msg_text
+                or "no room" in msg_text
+            )
+            if stepped_tile in ("#", "+"):
                 self._tile_under_player = stepped_tile
+            elif stepped_tile == "%" and not picked_up_or_stepped_item:
+                self._tile_under_player = "%"
             elif (stepped_tile in _ITEM_CHARS or stepped_tile == "*") and not messages:
                 # Under hallucination, an unseen staircase is drawn as a random
                 # item/gold glyph (daemons.c:260), so stepping onto it produces
@@ -277,6 +290,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 self._tile_under_player = stepped_tile
             else:
                 self._tile_under_player = "."
+        elif action_idx == 10 and self._status.level == prev_status.level:
+            self._tile_under_player = "."
         elif action_idx == 11 and "no room" not in msg_text:
             self._tile_under_player = "."
 
@@ -318,7 +333,6 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 screen_arr = screen_to_array(lines)
 
         self._last_pos = curr_pos
-        self._last_screen = screen_arr
 
         terminated = (
             not self.client.alive
@@ -327,7 +341,10 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         )
         if terminated and self._status.hp > 0:
             self._status = replace(self._status, hp=0)
-        effective_max_steps = self.max_steps + 500 * max(0, self._status.level - 1)
+        per_level_steps = 500 if self.max_steps >= 500 else 0
+        effective_max_steps = self.max_steps + per_level_steps * max(
+            0, self._status.level - 1
+        )
         truncated = (not terminated) and (self._steps >= effective_max_steps)
         if terminated:
             self._end = "death"
@@ -339,9 +356,14 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         # it must not count as newly explored tiles.
         new_tiles = 0
         if not terminated:
+            self._seen_floor_mask |= screen_arr[1:23] == ord(".")
+            erased_floor = (screen_arr[1:23] == ord(" ")) & self._seen_floor_mask
+            screen_arr[1:23][erased_floor] = ord(".")
             curr_mask = screen_arr[1:23] != 32
             new_tiles = int(np.count_nonzero(curr_mask & ~self._seen_mask))
             self._seen_mask |= curr_mask
+
+        self._last_screen = screen_arr
 
         new_visit = False
         revisit_count = 0
@@ -757,6 +779,41 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             return False
         return "A" <= chr(int(prev_screen[nr, nc])) <= "Z"
 
+    @staticmethod
+    def _stairs_distances(screen_arr: np.ndarray) -> dict[tuple[int, int], int]:
+        """Shortest-path step distances to any visible '%' staircase."""
+        stairs = [
+            (r, c)
+            for r in range(1, 23)
+            for c in range(80)
+            if int(screen_arr[r, c]) == ord("%")
+        ]
+        if not stairs:
+            return {}
+        dist: dict[tuple[int, int], int] = {}
+        queue: deque[tuple[int, int]] = deque()
+        for sr, sc in stairs:
+            dist[(sr, sc)] = 0
+            queue.append((sr, sc))
+        while queue:
+            r, c = queue.popleft()
+            d = dist[(r, c)]
+            for dr, dc in _MOVE_DELTAS:
+                nr, nc = r - dr, c - dc
+                if not (1 <= nr <= 22 and 0 <= nc < 80) or (nr, nc) in dist:
+                    continue
+                ch = chr(int(screen_arr[nr, nc]))
+                if ch in _WALL_CHARS or ("A" <= ch <= "Z"):
+                    continue
+                if dr != 0 and dc != 0:
+                    orth_r = chr(int(screen_arr[r, nc]))
+                    orth_c = chr(int(screen_arr[nr, c]))
+                    if orth_r in _WALL_CHARS or orth_c in _WALL_CHARS:
+                        continue
+                dist[(nr, nc)] = d + 1
+                queue.append((nr, nc))
+        return dist
+
     def _compute_action_mask(
         self, screen_arr: np.ndarray, player_pos: Optional[tuple[int, int]]
     ) -> np.ndarray:
@@ -764,6 +821,9 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         if player_pos is not None:
             pr, pc = player_pos
             monster_adjacent = False
+            monster_in_view = bool(
+                np.any((screen_arr[1:23] >= ord("A")) & (screen_arr[1:23] <= ord("Z")))
+            )
             searchable_adjacent = False
 
             for idx, (dr, dc) in enumerate(_MOVE_DELTAS):
@@ -788,6 +848,18 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                         orth_c = chr(int(screen_arr[pr, nc]))
                         if orth_r in _WALL_CHARS or orth_c in _WALL_CHARS:
                             mask[idx] = 0
+
+            if self._tile_under_player == "%":
+                mask[:] = 0
+                if (
+                    self._status.hp < self._status.max_hp
+                    and not monster_in_view
+                    and self._status.hungry_state == 0
+                ):
+                    mask[8] = 1
+                else:
+                    mask[10] = 1
+                return mask
 
             # Fight back: when an adjacent monster can be attacked, attacking
             # is the only legal action.  The move toward it must have survived
@@ -825,34 +897,68 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     if mask[idx] == 1
                 ]
 
-                # 1. Corridor / doorway forward flow: avoid immediate U-turns unless at a dead end
-                if (
-                    len(valid_moves) > 1
-                    and self._prev_pos is not None
-                    and self._tile_under_player in ("#", "+")
-                ):
-                    for idx, nr, nc in valid_moves:
-                        if (nr, nc) == self._prev_pos:
-                            mask[idx] = 0
-
-                # 2. Room corner / revisit gradient escape: steer toward least-visited
-                # neighbor tiles (treating stairs/items as 0 so they are always reachable)
-                remaining_moves = [
-                    (idx, nr, nc) for idx, nr, nc in valid_moves if mask[idx] == 1
+                stairs_dist = self._stairs_distances(screen_arr)
+                reachable_stairs = [
+                    (idx, stairs_dist[(nr, nc)])
+                    for idx, nr, nc in valid_moves
+                    if (nr, nc) in stairs_dist
                 ]
-                if len(remaining_moves) > 1:
-                    eff_visits: list[tuple[int, int]] = []
-                    for idx, nr, nc in remaining_moves:
-                        ch = chr(int(screen_arr[nr, nc]))
-                        if ch == "%" or ch in _ITEM_CHARS:
-                            eff_v = 0
-                        else:
-                            eff_v = int(self._visit_counts[nr - 1, nc])
-                        eff_visits.append((idx, eff_v))
-                    min_v = min(v for _, v in eff_visits)
-                    for idx, eff_v in eff_visits:
-                        if eff_v > min_v:
+                if reachable_stairs:
+                    min_d = min(d for _, d in reachable_stairs)
+                    best_idxs = {idx for idx, d in reachable_stairs if d == min_d}
+                    for idx, _, _ in valid_moves:
+                        if idx not in best_idxs:
                             mask[idx] = 0
+                    mask[8] = 0
+                    mask[9] = 0
+                elif (
+                    self._status.hp < 0.6 * self._status.max_hp
+                    and not monster_in_view
+                    and self._status.hungry_state == 0
+                    and self._tile_under_player not in _ITEM_CHARS
+                ):
+                    mask[:] = 0
+                    mask[8] = 1
+                    return mask
+                else:
+                    # 1. Corridor / doorway forward flow: avoid immediate U-turns unless at a dead end;
+                    # at a '#' corridor dead end, finish searching up to the cap before turning back.
+                    if (
+                        len(valid_moves) == 1
+                        and self._prev_pos is not None
+                        and self._tile_under_player == "#"
+                        and (valid_moves[0][1], valid_moves[0][2]) == self._prev_pos
+                        and mask[9] == 1
+                    ):
+                        mask[valid_moves[0][0]] = 0
+                        mask[8] = 0
+                    elif (
+                        len(valid_moves) > 1
+                        and self._prev_pos is not None
+                        and self._tile_under_player in ("#", "+")
+                    ):
+                        for idx, nr, nc in valid_moves:
+                            if (nr, nc) == self._prev_pos:
+                                mask[idx] = 0
+
+                    # 2. Room corner / revisit gradient escape: steer toward least-visited
+                    # neighbor tiles (treating stairs/items as 0 so they are always reachable)
+                    remaining_moves = [
+                        (idx, nr, nc) for idx, nr, nc in valid_moves if mask[idx] == 1
+                    ]
+                    if len(remaining_moves) > 1:
+                        eff_visits: list[tuple[int, int]] = []
+                        for idx, nr, nc in remaining_moves:
+                            ch = chr(int(screen_arr[nr, nc]))
+                            if ch == "%" or ch in _ITEM_CHARS:
+                                eff_v = 0
+                            else:
+                                eff_v = int(self._visit_counts[nr - 1, nc])
+                            eff_visits.append((idx, eff_v))
+                        min_v = min(v for _, v in eff_visits)
+                        for idx, eff_v in eff_visits:
+                            if eff_v > min_v:
+                                mask[idx] = 0
 
         if self._tile_under_player != "%":
             mask[10] = 0  # '>' only valid on stairs

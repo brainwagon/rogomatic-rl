@@ -25,6 +25,33 @@ DEFAULT_SCORE_FILE = Path(__file__).resolve().parents[1] / "scores" / "rogue.scr
 _SCORE_FILE_NAME = "rogue.scr"
 
 
+class _VT100Screen(pyte.Screen):
+    """pyte.Screen with standard VT100 margin-clamping rules when DECOM is off.
+
+    pyte unconditionally clamps cursor.y to ``margins`` in ``restore_cursor``,
+    ``cursor_up``, and ``cursor_down`` even when Origin Mode (DECOM) is off.
+    When ncurses uses ``csr`` (``\\x1b7\\x1b[top;botr\\x1b8``) with a cursor outside
+    the new scroll region, clamping ``\\x1b8`` shifts the cursor by a row so the
+    subsequent ``\\x1bM`` / ``\\n`` misses the margin boundary and fails to scroll.
+    """
+
+    def restore_cursor(self) -> None:
+        saved_y = self.savepoints[-1].cursor.y if self.savepoints else None
+        super().restore_cursor()
+        if saved_y is not None and pyte.modes.DECOM not in self.mode:
+            self.cursor.y = min(max(0, saved_y), self.lines - 1)
+
+    def cursor_up(self, count: Optional[int] = None) -> None:
+        top, _ = self.margins or pyte.screens.Margins(0, self.lines - 1)
+        limit = top if self.cursor.y >= top else 0
+        self.cursor.y = max(self.cursor.y - (count or 1), limit)
+
+    def cursor_down(self, count: Optional[int] = None) -> None:
+        _, bottom = self.margins or pyte.screens.Margins(0, self.lines - 1)
+        limit = bottom if self.cursor.y <= bottom else self.lines - 1
+        self.cursor.y = min(self.cursor.y + (count or 1), limit)
+
+
 class RoguePTYClient:
     """Manages a Rogue 5.4 child process over a 24x80 pseudo-terminal."""
 
@@ -53,7 +80,7 @@ class RoguePTYClient:
             Path(score_file).resolve() if score_file is not None else None
         )
 
-        self.screen = pyte.Screen(self.COLS, self.ROWS)
+        self.screen = _VT100Screen(self.COLS, self.ROWS)
         self.stream = pyte.Stream(self.screen)
 
         self._master_fd: Optional[int] = None
