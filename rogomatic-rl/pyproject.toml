@@ -21,3 +21,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["rogomatic_rl*"]
+
+[tool.setuptools.package-data]
+rogomatic_rl = ["*.html"]

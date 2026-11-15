@@ -1,0 +1,127 @@
+<div id="__ID__" class="rogue-replay">
+<style>
+.rogue-replay#__ID__ { max-width: 46em; margin: 1.5em auto; font-family: system-ui, sans-serif; color: inherit; }
+.rogue-replay#__ID__ .rr-screen { margin: 0; padding: 10px 12px; background: #101410; color: #c8d6c0; border-radius: 6px; font-family: ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace; font-size: 13px; line-height: 1.18; white-space: pre; overflow: hidden; text-align: left; border: 1px solid #2c362c; }
+.rogue-replay#__ID__ .rr-at { color: #ffd75f; font-weight: bold; }
+.rogue-replay#__ID__ .rr-mon { color: #ff8a70; }
+.rogue-replay#__ID__ .rr-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 8px; font-size: 14px; }
+.rogue-replay#__ID__ .rr-bar button { font: inherit; min-width: 2.4em; padding: 3px 8px; border: 1px solid #8886; border-radius: 4px; background: #8882; color: inherit; cursor: pointer; }
+.rogue-replay#__ID__ .rr-bar button:hover { background: #8884; }
+.rogue-replay#__ID__ .rr-bar select { font: inherit; padding: 2px 4px; }
+.rogue-replay#__ID__ .rr-scrub { flex: 1 1 10em; min-width: 8em; }
+.rogue-replay#__ID__ .rr-step { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rogue-replay#__ID__ .rr-key { display: inline-block; min-width: 1.4em; padding: 0 4px; border: 1px solid #8886; border-radius: 3px; font-family: ui-monospace, Menlo, Consolas, monospace; text-align: center; }
+.rogue-replay#__ID__ .rr-caption { margin-top: 6px; font-size: 13px; opacity: 0.8; }
+</style>
+<pre class="rr-screen" role="img" aria-label="Replay of a game of Rogue"></pre>
+<div class="rr-bar">
+<button type="button" data-a="start" title="Back to the start" aria-label="Back to the start">&#x23EE;</button>
+<button type="button" data-a="prev" title="Back one move" aria-label="Back one move">&#x25C0;</button>
+<button type="button" data-a="play" title="Play or pause" aria-label="Play or pause">&#x25B6;</button>
+<button type="button" data-a="next" title="Forward one move" aria-label="Forward one move">&#x25B6;&#xFE0E;|</button>
+<input class="rr-scrub" type="range" min="0" max="0" value="0" aria-label="Position in the game">
+<span class="rr-step"></span>
+<span title="Key the agent pressed">key <span class="rr-key">&nbsp;</span></span>
+<label>speed <select class="rr-speed" aria-label="Playback speed">
+<option value="0.25">&#xBC;&times;</option><option value="0.5">&#xBD;&times;</option><option value="1" selected>1&times;</option><option value="2">2&times;</option><option value="4">4&times;</option><option value="10">10&times;</option>
+</select></label>
+</div>
+<div class="rr-caption">__CAPTION__</div>
+<script type="application/json" class="rr-data">__DATA__</script>
+<script>
+(function () {
+  var root = document.getElementById("__ID__");
+  if (!root || root.dataset.ready) { return; }
+  root.dataset.ready = "1";
+  var data = JSON.parse(root.querySelector(".rr-data").textContent);
+  var baseFps = __FPS__;
+  // Rebuild every screen from the first one plus the changed rows.
+  var frames = [];
+  var rows = data.frames[0].slice();
+  frames.push(rows);
+  for (var i = 1; i < data.frames.length; i++) {
+    var delta = data.frames[i];
+    rows = rows.slice();
+    for (var j = 0; j < delta.length; j += 2) { rows[delta[j]] = delta[j + 1]; }
+    frames.push(rows);
+  }
+  var screen = root.querySelector(".rr-screen");
+  var scrub = root.querySelector(".rr-scrub");
+  var stepLabel = root.querySelector(".rr-step");
+  var keyLabel = root.querySelector(".rr-key");
+  var speed = root.querySelector(".rr-speed");
+  var playButton = root.querySelector('[data-a="play"]');
+  var last = frames.length - 1;
+  var pos = 0;
+  var timer = null;
+  scrub.max = String(last);
+  function esc(text) {
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  function paint(row, index) {
+    var text = esc(row);
+    // Only the map rows hold the player and monsters; row 0 is the
+    // message line and the last row the status line.
+    if (index > 0 && index < data.rows - 1 && pos < last) {
+      text = text.replace(/[A-Z]/g, '<span class="rr-mon">$&</span>');
+      text = text.replace(/@/g, '<span class="rr-at">@</span>');
+    }
+    return text;
+  }
+  function show(index) {
+    pos = Math.max(0, Math.min(last, index));
+    var out = [];
+    var current = frames[pos];
+    for (var r = 0; r < data.rows; r++) { out.push(paint(current[r] || "", r)); }
+    screen.innerHTML = out.join("\n");
+    scrub.value = String(pos);
+    stepLabel.textContent = "move " + pos + " / " + last;
+    keyLabel.textContent = pos > 0 ? data.keys.charAt(pos - 1) : " ";
+  }
+  function stop() {
+    if (timer !== null) { clearInterval(timer); timer = null; }
+    playButton.innerHTML = "&#x25B6;";
+  }
+  function play() {
+    if (pos >= last) { show(0); }
+    stop();
+    playButton.innerHTML = "&#x23F8;";
+    timer = setInterval(function () {
+      if (pos >= last) { stop(); return; }
+      show(pos + 1);
+    }, 1000 / (baseFps * parseFloat(speed.value)));
+  }
+  root.querySelector(".rr-bar").addEventListener("click", function (event) {
+    var button = event.target.closest("button");
+    if (!button) { return; }
+    var action = button.dataset.a;
+    if (action === "play") { if (timer === null) { play(); } else { stop(); } return; }
+    stop();
+    if (action === "start") { show(0); }
+    if (action === "prev") { show(pos - 1); }
+    if (action === "next") { show(pos + 1); }
+  });
+  scrub.addEventListener("input", function () { stop(); show(parseInt(scrub.value, 10)); });
+  speed.addEventListener("change", function () { if (timer !== null) { play(); } });
+  // Keep all 80 columns visible at any width: size the text to the box.
+  function fit() {
+    var probe = document.createElement("span");
+    probe.textContent = "0000000000";
+    probe.style.visibility = "hidden";
+    screen.appendChild(probe);
+    var size = parseFloat(getComputedStyle(screen).fontSize);
+    var charWidth = probe.getBoundingClientRect().width / 10 / size;
+    screen.removeChild(probe);
+    var style = getComputedStyle(screen);
+    var inner = screen.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+    if (inner > 0 && charWidth > 0) {
+      screen.style.fontSize = Math.min(15, inner / (data.cols * charWidth)).toFixed(2) + "px";
+    }
+  }
+  show(0);
+  fit();
+  if (window.ResizeObserver) { new ResizeObserver(fit).observe(root); }
+  else { window.addEventListener("resize", fit); }
+})();
+</script>
+</div>

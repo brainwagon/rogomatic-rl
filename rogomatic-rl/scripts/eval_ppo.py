@@ -5,6 +5,10 @@ numbered dungeons (the same ones every time), and the outcome is printed
 and appended to a JSONL file so checkpoints can be compared.
 
 With ``--render`` it plays one game at a time on screen.
+
+With ``--record FILE`` it records a game for ``scripts/make_replay.py``,
+which turns it into a replay that can be embedded in a web page.
+``--record-best N`` plays N games and keeps the best one.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from rogomatic_rl.episodes import (
 )
 from rogomatic_rl.evaluate import DEFAULT_EVAL_SEED, evaluate_policy
 from rogomatic_rl.model import RogueActorCritic
+from rogomatic_rl.replay import describe_outcome, record_best, save
 
 
 def _describe(ep: int, record: EpisodeRecord) -> str:
@@ -119,6 +124,23 @@ def main() -> None:
     parser.add_argument(
         "--no-out", action="store_true", help="Do not write the evaluation row"
     )
+    parser.add_argument(
+        "--record",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Record a game to this JSON file for scripts/make_replay.py",
+    )
+    parser.add_argument(
+        "--record-best",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "With --record: play N games, in dungeons seed..seed+N-1, and "
+            "keep the one that got deepest (ties: most gold)"
+        ),
+    )
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--delay", type=float, default=0.05)
     parser.add_argument(
@@ -133,6 +155,30 @@ def main() -> None:
         help="Do not record --render games in the high score list",
     )
     args = parser.parse_args()
+    if args.record_best is not None and not args.record:
+        parser.error("--record-best needs --record FILE")
+    if args.record and args.render:
+        parser.error("--record and --render cannot be combined")
+
+    if args.record:
+        games = 1 if args.record_best is None else args.record_best
+        if games < 1:
+            parser.error("--record-best must be at least 1")
+        first = DEFAULT_EVAL_SEED if args.seed is None else args.seed
+        best, outcomes = record_best(
+            args.checkpoint,
+            seeds=[first + k for k in range(games)],
+            max_steps=args.max_steps,
+            deterministic=args.deterministic,
+            workers=args.num_envs,
+        )
+        for ep, outcome in enumerate(outcomes, start=1):
+            kept = "  <- kept" if outcome == best.outcome and games > 1 else ""
+            print(_describe(ep, outcome) + kept)
+        save(best, args.record)
+        print(f"Recorded: {describe_outcome(best.outcome)}")
+        print(f"Saved {len(best.frames)} screens to {args.record}")
+        return
 
     ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=True)
     agent = RogueActorCritic(num_actions=len(ACTIONS)).to(args.device)
