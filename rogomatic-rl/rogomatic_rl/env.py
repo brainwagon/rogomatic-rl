@@ -52,6 +52,9 @@ _MOVE_DELTAS: tuple[tuple[int, int], ...] = (
 
 _WALL_CHARS = frozenset({" ", "-", "|"})
 _ITEM_CHARS = frozenset({"!", "?", ":", ")", "]", "/", "=", ","})
+# What the agent walks over to collect before descending: items and gold.
+_COLLECT_CHARS = _ITEM_CHARS | {"*"}
+_COLLECT_CODES = np.array(sorted(ord(c) for c in _COLLECT_CHARS), dtype=np.uint8)
 
 # Reward terms.  A descent and a death are the same size, so reaching the
 # next level is not worth dying for, and every term is within about three
@@ -259,6 +262,10 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._visited_mask: np.ndarray = np.zeros((22, 80), dtype=bool)
         self._visit_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
         self._search_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
+        # Item tiles (screen row, col) already stepped on this level.  An
+        # item still drawn there could not be picked up (full pack), so it
+        # is never steered to again.
+        self._item_skip: set[tuple[int, int]] = set()
         self._has_food: bool = True
         self._pack: dict[str, str] = {}
         self._inventory_dirty: bool = False
@@ -292,6 +299,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._visited_mask.fill(False)
         self._visit_counts.fill(0)
         self._search_counts.fill(0)
+        self._item_skip.clear()
         self._prev_pos = None
         self._tile_under_player = "."
         self._has_food = True
@@ -362,11 +370,14 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             self._visited_mask.fill(False)
             self._visit_counts.fill(0)
             self._search_counts.fill(0)
+            self._item_skip.clear()
             self._prev_pos = None
             self._tile_under_player = "."
         elif curr_pos is not None and curr_pos != prev_pos:
             self._prev_pos = prev_pos
             stepped_tile = chr(int(self._last_screen[curr_pos[0], curr_pos[1]]))
+            if stepped_tile in _COLLECT_CHARS:
+                self._item_skip.add(curr_pos)
             picked_up_or_stepped_item = (
                 any(_PICKUP_RE.search(m) for m in messages)
                 or "gold pieces" in msg_text
@@ -1473,21 +1484,22 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         return "A" <= chr(int(prev_screen[nr, nc])) <= "Z"
 
     @staticmethod
-    def _stairs_distances(screen_arr: np.ndarray) -> dict[tuple[int, int], int]:
-        """Shortest-path step distances to any visible '%' staircase."""
-        stairs = [
-            (r, c)
-            for r in range(1, 23)
-            for c in range(80)
-            if int(screen_arr[r, c]) == ord("%")
-        ]
-        if not stairs:
-            return {}
+    def _path_distances(
+        screen_arr: np.ndarray,
+        goals: list[tuple[int, int]],
+        avoid: frozenset[str] = frozenset(),
+    ) -> dict[tuple[int, int], int]:
+        """Shortest-path step distances from every reachable tile to the goals.
+
+        Walls, unseen tiles and monsters block, as do diagonals past a
+        wall corner (Rogue refuses those moves).  Tiles showing a
+        character in `avoid` are not walked through either.
+        """
         dist: dict[tuple[int, int], int] = {}
         queue: deque[tuple[int, int]] = deque()
-        for sr, sc in stairs:
-            dist[(sr, sc)] = 0
-            queue.append((sr, sc))
+        for goal in goals:
+            dist[goal] = 0
+            queue.append(goal)
         while queue:
             r, c = queue.popleft()
             d = dist[(r, c)]
@@ -1496,7 +1508,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 if not (1 <= nr <= 22 and 0 <= nc < 80) or (nr, nc) in dist:
                     continue
                 ch = chr(int(screen_arr[nr, nc]))
-                if ch in _WALL_CHARS or ("A" <= ch <= "Z"):
+                if ch in _WALL_CHARS or ch in avoid or ("A" <= ch <= "Z"):
                     continue
                 if dr != 0 and dc != 0:
                     orth_r = chr(int(screen_arr[r, nc]))
@@ -1506,6 +1518,62 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 dist[(nr, nc)] = d + 1
                 queue.append((nr, nc))
         return dist
+
+    @classmethod
+    def _stairs_distances(cls, screen_arr: np.ndarray) -> dict[tuple[int, int], int]:
+        """Shortest-path step distances to any visible '%' staircase."""
+        rows, cols = np.nonzero(screen_arr[1:23] == ord("%"))
+        stairs = [(int(r) + 1, int(c)) for r, c in zip(rows, cols)]
+        if not stairs:
+            return {}
+        return cls._path_distances(screen_arr, stairs)
+
+    def _item_distances(self, screen_arr: np.ndarray) -> dict[tuple[int, int], int]:
+        """Shortest-path step distances to the visible items worth collecting.
+
+        Items and gold count, except tiles already stepped on this level.
+        Weak or fainting with no food, only food counts.  Paths avoid
+        known traps ('^').
+        """
+        if self._status.hungry_state >= 2 and not self._has_food:
+            wanted = screen_arr[1:23] == ord(":")
+        else:
+            wanted = np.isin(screen_arr[1:23], _COLLECT_CODES)
+        rows, cols = np.nonzero(wanted)
+        goals = [
+            (int(r) + 1, int(c))
+            for r, c in zip(rows, cols)
+            if (int(r) + 1, int(c)) not in self._item_skip
+        ]
+        if not goals:
+            return {}
+        return self._path_distances(screen_arr, goals, avoid=frozenset("^"))
+
+    @staticmethod
+    def _steer(
+        mask: np.ndarray, pos: tuple[int, int], dist: dict[tuple[int, int], int]
+    ) -> bool:
+        """Keep only the legal moves on a shortest path in `dist`.
+
+        Also masks resting and searching.  Returns False, leaving `mask`
+        unchanged, when no legal move reaches a tile in `dist`.
+        """
+        pr, pc = pos
+        reachable = [
+            (idx, dist[(pr + dr, pc + dc)])
+            for idx, (dr, dc) in enumerate(_MOVE_DELTAS)
+            if mask[idx] == 1 and (pr + dr, pc + dc) in dist
+        ]
+        if not reachable:
+            return False
+        min_d = min(d for _, d in reachable)
+        best = {idx for idx, d in reachable if d == min_d}
+        for idx in range(len(_MOVE_DELTAS)):
+            if idx not in best:
+                mask[idx] = 0
+        mask[8] = 0
+        mask[9] = 0
+        return True
 
     def _compute_action_mask(
         self, screen_arr: np.ndarray, player_pos: Optional[tuple[int, int]]
@@ -1542,16 +1610,25 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                         if orth_r in _WALL_CHARS or orth_c in _WALL_CHARS:
                             mask[idx] = 0
 
+            # Visible items to collect before going down.  Not while a
+            # monster is in view: fighting or fleeing comes first.
+            item_dist = {} if monster_in_view else self._item_distances(screen_arr)
+
             if self._tile_under_player == "%":
-                mask[:] = 0
                 if (
                     self._status.hp < self._status.max_hp
                     and not monster_in_view
                     and self._status.hungry_state == 0
                 ):
+                    mask[:] = 0
                     mask[8] = 1
-                else:
-                    mask[10] = 1
+                    return mask
+                to_item = mask.copy()
+                to_item[8:] = 0
+                if item_dist and self._steer(to_item, player_pos, item_dist):
+                    return to_item
+                mask[:] = 0
+                mask[10] = 1
                 return mask
 
             # Fight back: when an adjacent monster can be attacked, attacking
@@ -1590,20 +1667,10 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     if mask[idx] == 1
                 ]
 
-                stairs_dist = self._stairs_distances(screen_arr)
-                reachable_stairs = [
-                    (idx, stairs_dist[(nr, nc)])
-                    for idx, nr, nc in valid_moves
-                    if (nr, nc) in stairs_dist
-                ]
-                if reachable_stairs:
-                    min_d = min(d for _, d in reachable_stairs)
-                    best_idxs = {idx for idx, d in reachable_stairs if d == min_d}
-                    for idx, _, _ in valid_moves:
-                        if idx not in best_idxs:
-                            mask[idx] = 0
-                    mask[8] = 0
-                    mask[9] = 0
+                if item_dist and self._steer(mask, player_pos, item_dist):
+                    pass  # collect visible items before anything else
+                elif self._steer(mask, player_pos, self._stairs_distances(screen_arr)):
+                    pass
                 elif (
                     self._status.hp < 0.6 * self._status.max_hp
                     and not monster_in_view

@@ -1551,3 +1551,97 @@ def test_real_rogue_reads_scrolls_and_leaves_no_prompt_behind() -> None:
         assert terminated is False
     finally:
         env.close()
+
+
+def _wide_room() -> list[str]:
+    """A 3x7 room, rows 4-6 and columns 2-8, with the player at (5, 5)."""
+    lines = _blank_screen()
+    lines = _with(lines, 4, 2, ".......")
+    lines = _with(lines, 5, 2, "...@...")
+    lines = _with(lines, 6, 2, ".......")
+    return lines
+
+
+def _legal(mask: np.ndarray) -> list[str]:
+    return [ACTIONS[i] for i in np.flatnonzero(mask)]
+
+
+def test_visible_item_is_collected_before_the_stairs() -> None:
+    # Stairs two tiles right, gold three tiles left: go left first.
+    lines = _with(_with(_wide_room(), 5, 7, "%"), 5, 2, "*")
+
+    mask = _mask_at(lines, (5, 5))
+
+    assert set(_legal(mask)) <= {"h", "y", "b"}
+    assert "h" in _legal(mask)
+
+
+def test_items_are_steered_to_with_no_stairs_in_view() -> None:
+    lines = _with(_wide_room(), 4, 8, "!")  # potion up and to the right
+
+    mask = _mask_at(lines, (5, 5))
+
+    # Each of these is two moves from the potion; anything left is further.
+    assert _legal(mask) == ["l", "u", "n"]
+
+
+def test_standing_on_stairs_steps_off_to_collect_a_visible_item() -> None:
+    lines = _with(_wide_room(), 5, 8, ":")  # food three tiles right
+    env = _fake_env({}, lines)
+    env._tile_under_player = "%"
+
+    mask = env._compute_action_mask(screen_to_array(lines), (5, 5))
+
+    assert _legal(mask) == ["l", "u", "n"]
+
+
+def test_no_item_detour_while_a_monster_is_in_view() -> None:
+    lines = _with(_with(_wide_room(), 5, 2, "*"), 4, 8, "K")
+    env = _fake_env({}, lines)
+    env._tile_under_player = "%"
+
+    mask = env._compute_action_mask(screen_to_array(lines), (5, 5))
+
+    assert _legal(mask) == [">"]
+
+
+def test_item_left_after_stepping_on_it_is_skipped_until_the_next_level() -> None:
+    # The pack is full: stepping onto the scroll leaves it on the floor.
+    before = _with(_with(_wide_room(), 5, 6, "?"), 23, 0, _status_line())
+    on_item = _with(_with(before, 5, 5, ".@"), 0, 0, "you moved onto a scroll")
+    env = _fake_env({"l": on_item}, before)
+    env._status = parse_status(before[23]) or RogueStatus()
+    env._last_pos = (5, 5)
+    env.step(3)  # 'l'
+    assert (5, 6) in env._item_skip
+
+    # Back where it started, the scroll at (5, 6) no longer attracts.
+    mask = env._compute_action_mask(screen_to_array(before), (5, 5))
+    assert "h" in _legal(mask)
+
+    # A new level clears the skip set.
+    deeper = _with(before, 23, 0, _status_line(level=2))
+    env.client._screens[">"] = deeper  # type: ignore[attr-defined]
+    env.step(10)
+    assert not env._item_skip
+
+
+def test_item_paths_avoid_known_traps() -> None:
+    # The only way to the gold, through a corridor, is over a trap.
+    lines = _with(_room(), 5, 6, "^##*")
+    lines = _with(lines, 4, 6, " ")
+    lines = _with(lines, 6, 6, " ")
+
+    env = _fake_env({}, lines)
+    assert env._item_distances(screen_to_array(lines)).get((5, 5)) is None
+
+
+def test_weak_with_no_food_only_food_is_worth_a_detour() -> None:
+    lines = _with(_with(_wide_room(), 5, 2, "*"), 5, 8, ":")
+    env = _fake_env({}, lines)
+    env._status = RogueStatus(hp=12, max_hp=12, hungry_state=2)
+    env._has_food = False
+
+    mask = env._compute_action_mask(screen_to_array(lines), (5, 5))
+
+    assert set(_legal(mask)) <= {"l", "u", "n"}
