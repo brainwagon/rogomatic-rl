@@ -95,6 +95,43 @@ def format_summary(summary: Mapping[str, Any]) -> str:
     )
 
 
+_STAT_FIELDS = (
+    ("dungeon level", "level"),
+    ("player level", "exp_level"),
+    ("gold", "gold"),
+    ("steps", "steps"),
+)
+
+
+def format_stats(records: Iterable[EpisodeRecord]) -> str:
+    """A table of how deep, how strong, how rich and how long the games got.
+
+    Mean, median, minimum and maximum of the dungeon level reached, the
+    player (experience) level, gold and steps, then how many games ended
+    on each dungeon level.
+    """
+    recs = list(records)
+    if not recs:
+        return "0 games"
+    ends = Counter(r.end for r in recs)
+    lines = [
+        f"{len(recs)} games: " + ", ".join(f"{n} {e}" for e, n in sorted(ends.items())),
+        f"{'':14}{'mean':>8}{'median':>8}{'min':>8}{'max':>8}",
+    ]
+    for label, field in _STAT_FIELDS:
+        values = np.array([getattr(r, field) for r in recs])
+        lines.append(
+            f"{label:14}{values.mean():8.2f}{np.median(values):8g}"
+            f"{values.min():8d}{values.max():8d}"
+        )
+    counts = sorted(Counter(r.level for r in recs).items())
+    lines.append(
+        "games ending on each dungeon level: "
+        + " ".join(f"{level}:{n}" for level, n in counts)
+    )
+    return "\n".join(lines)
+
+
 class EpisodeWindow:
     """The most recent ``size`` finished games."""
 

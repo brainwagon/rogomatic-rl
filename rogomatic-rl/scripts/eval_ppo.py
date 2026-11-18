@@ -9,6 +9,9 @@ With ``--render`` it plays one game at a time on screen.
 With ``--record FILE`` it records a game for ``scripts/make_replay.py``,
 which turns it into a replay that can be embedded in a web page.
 ``--record-best N`` plays N games and keeps the best one.
+
+Every mode ends with a table of the dungeon level, player level, gold
+and steps over the games played (mean, median, minimum and maximum).
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from rogomatic_rl import ACTIONS, DEFAULT_SCORE_FILE, RogueEnv
 from rogomatic_rl.episodes import (
     EpisodeRecord,
     append_jsonl,
+    format_stats,
     format_summary,
     summarize,
 )
@@ -43,7 +47,10 @@ def _describe(ep: int, record: EpisodeRecord) -> str:
 
 
 def _watch(agent: RogueActorCritic, args: argparse.Namespace) -> list[EpisodeRecord]:
-    """Play games one at a time on screen."""
+    """Play games one at a time on screen.
+
+    Ctrl-C stops early and returns the games finished so far.
+    """
     env = RogueEnv(
         max_steps=args.max_steps,
         render_mode="human",
@@ -83,6 +90,8 @@ def _watch(agent: RogueActorCritic, args: argparse.Namespace) -> list[EpisodeRec
 
             records.append(EpisodeRecord.from_info(info, ret=total_reward, seed=seed))
             print(_describe(ep + 1, records[-1]))
+    except KeyboardInterrupt:
+        print(f"Interrupted after {len(records)} finished games")
     finally:
         env.close()
     return records
@@ -177,6 +186,7 @@ def main() -> None:
         for ep, outcome in enumerate(outcomes, start=1):
             kept = "  <- kept" if outcome == best.outcome and games > 1 else ""
             print(_describe(ep, outcome) + kept)
+        print(format_stats(outcomes))
         save(best, args.record)
         print(f"Recorded: {describe_outcome(best.outcome)}")
         print(f"Saved {len(best.frames)} screens to {args.record}")
@@ -190,7 +200,7 @@ def main() -> None:
     if args.render:
         args.episodes = 3 if args.episodes is None else args.episodes
         agent.to("cpu")
-        _watch(agent, args)
+        print(format_stats(_watch(agent, args)))
         return
 
     episodes = 50 if args.episodes is None else args.episodes
@@ -207,6 +217,7 @@ def main() -> None:
     for ep, record in enumerate(records, start=1):
         print(_describe(ep, record))
     summary = summarize(records)
+    print(format_stats(records))
     print(f"eval {format_summary(summary)}")
     if summary.get("killers"):
         print(f"killers {summary['killers']}")

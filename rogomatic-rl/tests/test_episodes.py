@@ -15,6 +15,7 @@ from rogomatic_rl.episodes import (
     EpisodeWindow,
     append_jsonl,
     episode_row,
+    format_stats,
     format_summary,
     summarize,
 )
@@ -66,6 +67,27 @@ def test_format_summary_is_one_key_value_line() -> None:
         "n=2 lvl_mean=2.50 lvl_med=2.5 lvl_max=4 len=100 gold=10.0 exp=5.0 "
         "death=0.50 time_limit=0.50"
     )
+
+
+def test_format_stats_tabulates_depth_player_level_gold_and_steps() -> None:
+    table = format_stats(
+        [
+            _record(1, exp_level=1, gold=0, steps=100),
+            _record(3, exp_level=4, gold=50, steps=900),
+            _record(8, end="time_limit", exp_level=7, gold=400, steps=2000),
+        ]
+    )
+
+    assert table.splitlines() == [
+        "3 games: 2 death, 1 time_limit",
+        "                  mean  median     min     max",
+        "dungeon level     4.00       3       1       8",
+        "player level      4.00       4       1       7",
+        "gold            150.00      50       0     400",
+        "steps          1000.00     900     100    2000",
+        "games ending on each dungeon level: 1:1 3:1 8:1",
+    ]
+    assert format_stats([]) == "0 games"
 
 
 def test_window_keeps_only_the_most_recent_games() -> None:
