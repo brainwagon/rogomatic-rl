@@ -51,6 +51,15 @@ _MOVE_DELTAS: tuple[tuple[int, int], ...] = (
 )
 
 _WALL_CHARS = frozenset({" ", "-", "|"})
+# Rogue 5.4 places each room inside one cell of a 3x3 grid, NUMCOLS / 3
+# columns by NUMLINES / 3 rows (do_rooms in rooms.c).  Cell column k
+# holds room columns 26k+1 .. 26k+25 and cell row k screen rows
+# 8k .. 8k+7.
+_CELL_COLS = 26
+_CELL_ROWS = 8
+# Tiles that are not room floor when deciding which side of a wall is
+# the inside of the room.
+_NOT_FLOOR = frozenset(" #+-|")
 _ITEM_CHARS = frozenset({"!", "?", ":", ")", "]", "/", "=", ","})
 # What the agent walks over to collect before descending: items and gold.
 _COLLECT_CHARS = _ITEM_CHARS | {"*"}
@@ -289,6 +298,9 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._visited_mask: np.ndarray = np.zeros((22, 80), dtype=bool)
         self._visit_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
         self._search_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
+        # Searches made next to each tile, so a wall tile counts as searched
+        # whichever neighbouring spot the search was made from.
+        self._wall_search_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
         self._level_steps: int = 0  # steps taken on the current level
         # Item tiles (screen row, col) already stepped on this level.  An
         # item still drawn there could not be picked up (full pack), so it
@@ -340,6 +352,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._visited_mask.fill(False)
         self._visit_counts.fill(0)
         self._search_counts.fill(0)
+        self._wall_search_counts.fill(0)
         self._level_steps = 0
         self._item_skip.clear()
         self._prev_pos = None
@@ -419,6 +432,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             self._visited_mask.fill(False)
             self._visit_counts.fill(0)
             self._search_counts.fill(0)
+            self._wall_search_counts.fill(0)
             self._level_steps = 0
             self._item_skip.clear()
             self._zapped_at.clear()
@@ -534,6 +548,9 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             r_idx, c_idx = curr_pos[0] - 1, curr_pos[1]
             if action_idx == 9:  # 's' search
                 self._search_counts[r_idx, c_idx] += 1
+                self._wall_search_counts[
+                    max(0, r_idx - 1) : r_idx + 2, max(0, c_idx - 1) : c_idx + 2
+                ] += 1
             if not self._visited_mask[r_idx, c_idx]:
                 self._visited_mask[r_idx, c_idx] = True
                 self._visit_counts[r_idx, c_idx] = 1
@@ -1888,6 +1905,15 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         passage.  Empty when the player is standing on one, so the dead-end
         search rule can act there.
         """
+        goals = self._dead_end_tiles(screen_arr, player_pos)
+        if not goals or player_pos in goals:
+            return {}
+        return self._path_distances(screen_arr, goals, avoid=frozenset("^"))
+
+    def _dead_end_tiles(
+        self, screen_arr: np.ndarray, player_pos: tuple[int, int]
+    ) -> list[tuple[int, int]]:
+        """Corridor dead ends (screen row, col) still under the search cap."""
         dungeon = screen_arr[1:23]
         corridor = dungeon == ord("#")
         pr, pc = player_pos
@@ -1902,10 +1928,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         )
         dead_end = corridor & (neighbours == 1) & (self._search_counts < self._search_cap())
         rows, cols = np.nonzero(dead_end)
-        goals = [(int(r) + 1, int(c)) for r, c in zip(rows, cols)]
-        if not goals or player_pos in goals:
-            return {}
-        return self._path_distances(screen_arr, goals, avoid=frozenset("^"))
+        return [(int(r) + 1, int(c)) for r, c in zip(rows, cols)]
 
     def _search_cap(self) -> int:
         """Searches allowed per spot: 6, and 6 more for every 500 steps on the level.
@@ -1915,6 +1938,183 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         time gets searched again.
         """
         return 6 * (1 + self._level_steps // 500)
+
+    def _map_rows(
+        self, screen_arr: np.ndarray, player_pos: Optional[tuple[int, int]]
+    ) -> list[str]:
+        """The screen as 24 strings, with the tile under the player in place of '@'."""
+        rows = [bytes(row).decode("ascii", "replace") for row in screen_arr]
+        if player_pos is not None:
+            pr, pc = player_pos
+            rows[pr] = rows[pr][:pc] + self._tile_under_player + rows[pr][pc + 1 :]
+        return rows
+
+    @staticmethod
+    def _door_wall(
+        rows: list[str], r: int, c: int
+    ) -> Optional[tuple[tuple[int, int], Optional[tuple[int, int]]]]:
+        """Whether the wall tile at (r, c) could be a secret door.
+
+        Rogue 5.4 puts a door on a room's wall only where it faces a room
+        in the next grid cell (conn in passages.c): the bottom wall toward
+        the cell below, the right wall toward the cell to the right, and
+        so on, never on a corner.  Each pair of cells is joined at most
+        once, so a wall side already showing a door has no other.
+
+        Returns None when the tile cannot be a door, and otherwise the
+        (dr, dc) step from the wall into the room and the (row, col) grid
+        cell the wall faces.  The facing cell is None when the tile's cell
+        cannot be worked out.
+        """
+
+        def at(y: int, x: int) -> str:
+            if 1 <= y <= 22 and 0 <= x < 80:
+                return rows[y][x]
+            return " "
+
+        ch = at(r, c)
+        if ch == "-":
+            if at(r - 1, c) == "|" or at(r + 1, c) == "|":
+                return None  # a corner
+            seg = [c]
+            for step in (-1, 1):
+                x = c + step
+                while at(r, x) in "-+":
+                    seg.append(x)
+                    x += step
+            if any(at(r, x) == "+" for x in seg):
+                return None
+            inward: Optional[tuple[int, int]] = None
+            if at(r + 1, c) not in _NOT_FLOOR:
+                inward = (1, 0)
+            elif at(r - 1, c) not in _NOT_FLOOR:
+                inward = (-1, 0)
+            else:
+                # Inside not seen: a corner tells which way the room lies.
+                for x in seg:
+                    if at(r + 1, x) == "|":
+                        inward = (1, 0)
+                        break
+                    if at(r - 1, x) == "|":
+                        inward = (-1, 0)
+                        break
+        elif ch == "|":
+            seg = [r]
+            ends = []
+            for step in (-1, 1):
+                y = r + step
+                while at(y, c) in "|+":
+                    seg.append(y)
+                    y += step
+                ends.append(y)
+            if any(at(y, c) == "+" for y in seg):
+                return None
+            inward = None
+            if at(r, c + 1) not in _NOT_FLOOR:
+                inward = (0, 1)
+            elif at(r, c - 1) not in _NOT_FLOOR:
+                inward = (0, -1)
+            else:
+                for y in ends:
+                    if at(y, c) == "-" and at(y, c + 1) == "-":
+                        inward = (0, 1)
+                        break
+                    if at(y, c) == "-" and at(y, c - 1) == "-":
+                        inward = (0, -1)
+                        break
+        else:
+            return None
+        if inward is None:
+            return None
+        cell_r = min(2, r // _CELL_ROWS)
+        cell_c = min(2, max(0, (c - 1) // _CELL_COLS))
+        # The wall faces away from the room: opposite to `inward`.
+        face_r, face_c = cell_r - inward[0], cell_c - inward[1]
+        if not (0 <= face_r <= 2 and 0 <= face_c <= 2):
+            return None  # faces the edge of the map
+        return inward, (face_r, face_c)
+
+    def _wall_search_tiers(
+        self, screen_arr: np.ndarray, player_pos: tuple[int, int]
+    ) -> list[set[tuple[int, int]]]:
+        """Spots to search from for secret doors, best first.
+
+        A spot is the floor tile just inside a wall tile that could be a
+        door (`_door_wall`) and has been searched fewer than
+        `_search_cap()` times.  Walls facing a grid cell where no room
+        floor has been seen come first, as a door there leads somewhere
+        new.  Within each, spots whose wall neighbours along the wall are
+        also unsearched come first, so searches 3 tiles apart cover the
+        wall with little overlap.  Empty tiers are left out.
+        """
+        rows = self._map_rows(screen_arr, player_pos)
+        cap = self._search_cap()
+        floor_r, floor_c = np.nonzero(self._seen_floor_mask)
+        reached = {
+            (min(2, (int(r) + 1) // _CELL_ROWS), min(2, max(0, (int(c) - 1) // _CELL_COLS)))
+            for r, c in zip(floor_r, floor_c)
+        }
+        walls: dict[tuple[int, int], tuple[tuple[int, int], Optional[tuple[int, int]]]] = {}
+        wall_r, wall_c = np.nonzero(np.isin(screen_arr[1:23], [ord("-"), ord("|")]))
+        for r0, c0 in zip(wall_r, wall_c):
+            r, c = int(r0) + 1, int(c0)
+            info = self._door_wall(rows, r, c)
+            if info is not None:
+                walls[(r, c)] = info
+
+        def done(pos: tuple[int, int]) -> bool:
+            return pos in walls and self._wall_search_counts[pos[0] - 1, pos[1]] >= cap
+
+        tiers: list[set[tuple[int, int]]] = [set(), set(), set(), set()]
+        for (r, c), ((dr, dc), facing) in walls.items():
+            if done((r, c)):
+                continue
+            sr, sc = r + dr, c + dc
+            if not (1 <= sr <= 22 and 0 <= sc < 80):
+                continue
+            ch = rows[sr][sc]
+            if ch in _NOT_FLOOR or ch == "^" or "A" <= ch <= "Z":
+                continue
+            # Along the wall is perpendicular to the inward step.
+            spaced = not done((r + dc, c + dr)) and not done((r - dc, c - dr))
+            new_cell = facing not in reached
+            tiers[(0 if new_cell else 2) + (0 if spaced else 1)].add((sr, sc))
+        return [t for t in tiers if t]
+
+    def _wall_searchable(
+        self, screen_arr: np.ndarray, player_pos: tuple[int, int]
+    ) -> bool:
+        """Whether a wall tile next to the player could be a door still worth searching."""
+        rows = self._map_rows(screen_arr, player_pos)
+        cap = self._search_cap()
+        pr, pc = player_pos
+        for dr, dc in _MOVE_DELTAS:
+            r, c = pr + dr, pc + dc
+            if not (1 <= r <= 22 and 0 <= c < 80) or rows[r][c] not in "-|":
+                continue
+            if (
+                self._wall_search_counts[r - 1, c] < cap
+                and self._door_wall(rows, r, c) is not None
+            ):
+                return True
+        return False
+
+    def _steer_wall_search(
+        self, mask: np.ndarray, screen_arr: np.ndarray, player_pos: tuple[int, int]
+    ) -> bool:
+        """Walk to the best spot for finding a secret door, and search there.
+
+        Returns False, leaving `mask` unchanged, when no spot is reachable.
+        """
+        for spots in self._wall_search_tiers(screen_arr, player_pos):
+            if player_pos in spots:
+                mask[:] = 0
+                mask[9] = 1
+                return True
+            dist = self._path_distances(screen_arr, list(spots), avoid=frozenset("^"))
+            if self._steer(mask, player_pos, dist):
+                return True
+        return False
 
     @staticmethod
     def _steer(
@@ -1962,12 +2162,12 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     ch = chr(int(screen_arr[nr, nc]))
                     if "A" <= ch <= "Z":
                         monster_adjacent = True
-                    if ch in ("-", "|") or (
+                    if (
                         ch == " "
                         and (dr == 0 or dc == 0)
                         and self._tile_under_player in ("#", "+")
                     ):
-                        searchable_adjacent = True
+                        searchable_adjacent = True  # a hidden corridor tile
 
                     if ch in _WALL_CHARS:
                         mask[idx] = 0
@@ -2019,11 +2219,19 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             if self._status.hp >= self._status.max_hp and not monster_adjacent:
                 mask[8] = 0
 
-            # Mask 's' (search) unless next to a wall / corridor dead-end and under the search cap
+            # Mask 's' (search) unless something next to the player could be
+            # hidden: a blank beside a corridor, under the per-spot search
+            # cap, or a wall tile that could be a secret door, searched
+            # fewer times than the cap.  Level 1 hides nothing: door() and
+            # putpass() in passages.c hide only when rnd(10) + 1 < level.
             curr_searches = (
                 int(self._search_counts[pr - 1, pc]) if 1 <= pr <= 22 else 0
             )
-            if not searchable_adjacent or curr_searches >= self._search_cap():
+            secrets_possible = self._status.level >= 2
+            if not secrets_possible or not (
+                (searchable_adjacent and curr_searches < self._search_cap())
+                or self._wall_searchable(screen_arr, player_pos)
+            ):
                 mask[9] = 0
 
             # Anti-oscillation & dead-end / room-corner escape when not in combat
@@ -2055,10 +2263,27 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     # view: one seen only from a doorway would otherwise
                     # switch the two rules back and forth.
                     pass
-                elif self._steer(
-                    mask, player_pos, self._dead_end_distances(screen_arr, player_pos)
+                elif (
+                    secrets_possible
+                    and not monster_in_view
+                    and self._steer(
+                        mask, player_pos, self._dead_end_distances(screen_arr, player_pos)
+                    )
                 ):
-                    pass  # nothing left to explore: go and search a dead end
+                    # Nothing left to explore: go and search a dead end.  Not
+                    # with a monster in view, for the same reason as above:
+                    # one seen only from a doorway sent the agent back and
+                    # forth between this rule and item steering.
+                    pass
+                elif (
+                    secrets_possible
+                    and not monster_in_view
+                    and player_pos not in self._dead_end_tiles(screen_arr, player_pos)
+                    and self._steer_wall_search(mask, screen_arr, player_pos)
+                ):
+                    # No dead ends left either: search the room walls that
+                    # could hide a door, those facing unexplored cells first.
+                    pass
                 else:
                     # 1. Corridor / doorway forward flow: avoid immediate U-turns unless at a dead end;
                     # at a '#' corridor dead end, finish searching up to the cap before turning back.

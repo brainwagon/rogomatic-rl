@@ -170,6 +170,7 @@ def test_breadcrumbs_and_anti_oscillation_mask() -> None:
         # With nothing left to explore (both ends visited and searched out), search ('s', idx 9)
         # is valid up to 6 times at a corridor bordering blank space, then masked
         env._visited_mask[4, 6] = True
+        env._status = RogueStatus(level=2)  # level 1 hides nothing to search for
         env._search_counts[4, 4] = 6
         env._search_counts[4, 6] = 6
         assert env._compute_action_mask(screen_arr, (5, 5))[9] == 1
@@ -952,6 +953,7 @@ def test_failed_descend_clears_stairs_tile_and_corridor_dead_end_searches_before
     dead_end = _with(dead_end, 5, 4, "#@")
     dead_end = _with(dead_end, 23, 0, _status_line(level=2))
     env2 = _fake_env({}, dead_end)
+    env2._status = parse_status(dead_end[23]) or RogueStatus()
     env2._tile_under_player = "#"
     env2._prev_pos = (5, 4)
     env2._visited_mask[4, 4:6] = True  # walked (5, 4) -> (5, 5)
@@ -1829,13 +1831,22 @@ def test_with_nothing_to_explore_go_and_search_a_dead_end() -> None:
     screen = screen_to_array(lines)
     env._seen_mask |= screen[1:23] != ord(" ")
     env._visited_mask[4, 2:8] = True
+    env._status = RogueStatus(level=2)
     env._tile_under_player = "#"
-    env._prev_pos = (5, 6)
+    # Came from the left, so without steering the no-U-turn rule says 'l'.
+    env._prev_pos = (5, 4)
     env._search_counts[4, 7] = 6  # the right end is searched out
 
     mask = env._compute_action_mask(screen, (5, 5))
 
     assert _legal(mask) == ["h"]
+
+    # Not on level 1, which hides nothing, nor with a monster in view.
+    env._status = RogueStatus(level=1)
+    assert _legal(env._compute_action_mask(screen, (5, 5))) == ["l"]
+    env._status = RogueStatus(level=2)
+    with_bat = screen_to_array(_with(lines, 9, 20, "B"))
+    assert "h" not in _legal(env._compute_action_mask(with_bat, (5, 5)))
 
 
 def test_no_frontier_steering_with_a_monster_in_view() -> None:
@@ -1863,3 +1874,137 @@ def test_search_cap_grows_with_time_on_the_level() -> None:
     assert env._search_cap() == 6
     env._level_steps = 1000
     assert env._search_cap() == 18
+
+
+def _walled_room(
+    top: int = 9,
+    left: int = 30,
+    bottom: int = 13,
+    right: int = 40,
+    player: tuple[int, int] = (11, 35),
+    *,
+    level: int = 2,
+    lit: bool = True,
+) -> list[str]:
+    """A walled room drawn as Rogue 5.4 does, '-' rows with '-' corners.
+
+    The default sits in grid cell (1, 1), the middle of the map, so every
+    wall faces a neighbouring cell.  Unlit, the floor is left blank.
+    """
+    lines = _blank_screen()
+    width = right - left + 1
+    lines = _with(lines, top, left, "-" * width)
+    lines = _with(lines, bottom, left, "-" * width)
+    inside = ("." if lit else " ") * (width - 2)
+    for r in range(top + 1, bottom):
+        lines = _with(lines, r, left, f"|{inside}|")
+    lines = _with(lines, player[0], player[1], "@")
+    return _with(lines, 23, 0, _status_line(level=level))
+
+
+def _explored_env(lines: list[str]) -> RogueEnv:
+    """A fake env on `lines` with the whole map seen and walked."""
+    env = _fake_env({}, lines)
+    env._status = parse_status(lines[23]) or RogueStatus()
+    env._seen_mask[:] = True
+    env._visited_mask[:] = True
+    env._seen_floor_mask[:] = screen_to_array(lines)[1:23] == ord(".")
+    return env
+
+
+def test_door_wall_rules_out_corners_map_edges_and_sides_with_a_door() -> None:
+    rows = _walled_room()
+    door_wall = RogueEnv._door_wall
+    assert door_wall(rows, 9, 30) is None  # corner
+    assert door_wall(rows, 13, 40) is None  # corner
+    assert door_wall(rows, 9, 35) == ((1, 0), (0, 1))  # top wall faces the cell above
+    assert door_wall(rows, 13, 35) == ((-1, 0), (2, 1))
+    assert door_wall(rows, 11, 30) == ((0, 1), (1, 0))
+    assert door_wall(rows, 11, 40) == ((0, -1), (1, 2))
+
+    # A side already showing a door has no other door.
+    with_door = _with(rows, 13, 33, "+")
+    assert door_wall(with_door, 13, 35) is None
+    assert door_wall(with_door, 9, 35) is not None
+
+    # A room in the top-left cell: its top and left walls face the edge.
+    corner_room = _walled_room(2, 3, 6, 12, (4, 7))
+    assert door_wall(corner_room, 2, 7) is None
+    assert door_wall(corner_room, 4, 3) is None
+    assert door_wall(corner_room, 6, 7) == ((-1, 0), (1, 0))
+    assert door_wall(corner_room, 4, 12) == ((0, -1), (0, 1))
+
+
+def test_door_wall_finds_the_inside_of_a_dark_room_from_its_corners() -> None:
+    rows = _walled_room(lit=False)
+    assert RogueEnv._door_wall(rows, 9, 35) == ((1, 0), (0, 1))
+    assert RogueEnv._door_wall(rows, 13, 35) == ((-1, 0), (2, 1))
+    assert RogueEnv._door_wall(rows, 11, 30) == ((0, 1), (1, 0))
+    assert RogueEnv._door_wall(rows, 11, 40) == ((0, -1), (1, 2))
+
+
+def test_search_is_legal_only_beside_a_possible_door_and_never_on_level_one() -> None:
+    # Inner top-left corner of a top-left room: every wall in reach faces
+    # the map edge or is a corner.
+    corner_room = _walled_room(2, 3, 6, 12, (3, 4))
+    assert "s" not in _legal(_explored_env(corner_room)._compute_action_mask(
+        screen_to_array(corner_room), (3, 4)
+    ))
+
+    # Beside the right wall, which faces the next cell, it is legal ...
+    by_right = _walled_room(2, 3, 6, 12, (4, 11))
+    env = _explored_env(by_right)
+    assert "s" in _legal(env._compute_action_mask(screen_to_array(by_right), (4, 11)))
+    # ... until those wall tiles have been searched the cap's worth ...
+    env._wall_search_counts[2:5, 12] = 6
+    assert "s" not in _legal(env._compute_action_mask(screen_to_array(by_right), (4, 11)))
+
+    # ... and never on level 1, where nothing is hidden.
+    level_one = _walled_room(2, 3, 6, 12, (4, 11), level=1)
+    env1 = _explored_env(level_one)
+    assert "s" not in _legal(env1._compute_action_mask(screen_to_array(level_one), (4, 11)))
+
+
+def test_steers_to_a_wall_that_could_hide_a_door_and_searches_there() -> None:
+    # Doors on the bottom, left and right walls leave the top wall.
+    lines = _walled_room(player=(12, 35))
+    lines = _with(lines, 13, 33, "+")
+    lines = _with(lines, 11, 30, "+")
+    lines = _with(lines, 11, 40, "+")
+    env = _explored_env(lines)
+    legal = _legal(env._compute_action_mask(screen_to_array(lines), (12, 35)))
+    assert legal and set(legal) <= {"k", "y", "u"}
+
+    at_wall = _with(_with(lines, 12, 35, "."), 10, 35, "@")
+    assert _legal(env._compute_action_mask(screen_to_array(at_wall), (10, 35))) == ["s"]
+
+
+def test_wall_search_spots_are_spaced_and_prefer_unexplored_cells() -> None:
+    lines = _walled_room(player=(11, 35))
+    env = _explored_env(lines)
+    arr = screen_to_array(lines)
+
+    # Searched out around (9, 35): the next spaced spots are 3 tiles away.
+    env._wall_search_counts[8, 34:37] = 6
+    tiers = env._wall_search_tiers(arr, (11, 35))
+    assert (10, 32) in tiers[0] and (10, 38) in tiers[0]
+    assert not {(10, 33), (10, 35), (10, 37)} & tiers[0]
+    assert (10, 33) in tiers[1] and (10, 37) in tiers[1]
+
+    # Room floor seen in the cell above: the top wall drops behind the others.
+    env._seen_floor_mask[2, 35] = True
+    tiers = env._wall_search_tiers(arr, (11, 35))
+    assert (10, 32) not in tiers[0] and (11, 39) in tiers[0]
+    # The other walls are all unsearched, so the second tier (unexplored
+    # cells, overlapping spots) is empty and left out.
+    assert (10, 32) in tiers[1] and (10, 33) in tiers[2]
+
+
+def test_a_search_counts_against_every_neighbouring_wall_tile() -> None:
+    lines = _walled_room(player=(10, 35))
+    env = _fake_env({"s": lines}, lines)
+    env._status = parse_status(lines[23]) or RogueStatus()
+    env._last_pos = (10, 35)
+    env.step(9)
+    assert env._wall_search_counts[8, 34:37].tolist() == [1, 1, 1]
+    assert env._wall_search_counts[8, 33] == 0
