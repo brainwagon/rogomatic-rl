@@ -1734,6 +1734,10 @@ def test_cancellation_once_per_monster_letter_per_level() -> None:
     env = _zap_env({"f": "A wand of cancellation(iron)"})
     sticks = env._usable_sticks()
     assert env._choose_zap(sticks, [(0, 1, "H", 99)]) is None  # hobgoblin: nothing to cancel
+    # An ice monster is left alone while it sleeps ...
+    assert env._choose_zap(sticks, [(0, 3, "I", 99)]) is None
+    # ... and cancelled once it has woken.
+    env._ice_awake = True
     assert env._choose_zap(sticks, [(0, 3, "I", 99)])[:2] == ("f", "cancellation")
     env._zapped_at.add(("cancellation", "I"))
     assert env._choose_zap(sticks, [(0, 3, "I", 99)]) is None
@@ -2008,3 +2012,78 @@ def test_a_search_counts_against_every_neighbouring_wall_tile() -> None:
     env.step(9)
     assert env._wall_search_counts[8, 34:37].tolist() == [1, 1, 1]
     assert env._wall_search_counts[8, 33] == 0
+
+
+def test_rests_to_full_while_max_hp_is_small_and_from_below_60_percent() -> None:
+    lines = _room()
+    env = _fake_env({}, lines)
+    screen = screen_to_array(lines)
+
+    env._status = RogueStatus(hp=11, max_hp=12)
+    assert _legal(env._compute_action_mask(screen, (5, 5))) == ["."]
+
+    env._resting = False  # a new case, not a continuation of that rest
+    env._status = RogueStatus(hp=25, max_hp=30)
+    assert "." not in _legal(env._compute_action_mask(screen, (5, 5)))
+
+    # Below 60% resting starts, and then goes on past 60% to full.
+    env._status = RogueStatus(hp=17, max_hp=30)
+    assert _legal(env._compute_action_mask(screen, (5, 5))) == ["."]
+    env._status = RogueStatus(hp=25, max_hp=30)
+    assert _legal(env._compute_action_mask(screen, (5, 5))) == ["."]
+
+    # A monster coming into view ends it.
+    with_bat = screen_to_array(_with(lines, 9, 20, "B"))
+    assert _legal(env._compute_action_mask(with_bat, (5, 5))) != ["."]
+    assert "." not in _legal(env._compute_action_mask(screen, (5, 5)))
+
+
+def test_a_sleeping_ice_monster_is_left_alone_until_it_wakes() -> None:
+    lines = _with(_room(), 5, 6, "I")
+    env = _fake_env({}, lines)
+    screen = screen_to_array(lines)
+
+    legal = _legal(env._compute_action_mask(screen, (5, 5)))
+    assert "l" not in legal  # no attack ...
+    assert "h" in legal  # ... and free to walk away
+    assert not env._monster_in_view(lines)
+    assert RogueEnv._find_missile_target(
+        screen_to_array(_with(_room(), 5, 7, "I")), (5, 5), frozenset("I")
+    ) is None
+
+    # Woken, or after long enough on the level, it is fought as usual.
+    env._level_steps = 800
+    assert _legal(env._compute_action_mask(screen, (5, 5))) == ["l"]
+    env._level_steps = 0
+    env._ice_awake = True
+    assert _legal(env._compute_action_mask(screen, (5, 5))) == ["l"]
+
+
+def test_an_ice_monster_message_marks_it_awake() -> None:
+    room = _room()
+    hit = _with(room, 0, 0, "The ice monster misses")
+    env = _fake_env({".": hit}, room)
+    env._last_pos = (5, 5)
+    env.step(8)
+    assert env._ice_awake
+
+
+def test_drinks_an_unknown_potion_when_the_next_hit_could_kill() -> None:
+    combat = _with(_room(), 5, 6, "H")
+    hurt = _with(combat, 23, 0, _status_line(hp=9, max_hp=20))
+    dying = _with(combat, 23, 0, _status_line(hp=7, max_hp=20))
+    quaff_prompt = _with(dying, 0, 0, "quaff what? (* for list): ")
+    env = _fake_env({"l": hurt, "q": quaff_prompt, "e": dying}, hurt)
+    env._last_pos = (5, 5)
+    env._status = parse_status(hurt[23]) or RogueStatus()
+    env._pack = {"d": "A potion of healing(blue)", "e": "A murky potion"}
+    env._inventory_dirty = False
+
+    env.step(3)  # hp 9: a hobgoblin hits for at most 8
+    assert env.client.keys == ["l"]
+
+    env.client._screens["l"] = dying
+    env.client.keys.clear()
+    env.step(3)  # hp 7: drink the unknown potion
+    assert env.client.keys[:3] == ["l", "q", "e"]
+    assert "murky" in env._tried_potion_colors

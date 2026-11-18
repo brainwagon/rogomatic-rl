@@ -60,6 +60,22 @@ _CELL_ROWS = 8
 # Tiles that are not room floor when deciding which side of a wall is
 # the inside of the room.
 _NOT_FLOOR = frozenset(" #+-|")
+
+# The most damage each monster can do in one turn: every attack hitting
+# for its maximum (the damage strings in monsters[], extern.c).  The
+# venus flytrap's grows while it holds the player; 8 stands in for it.
+_MONSTER_MAX_HIT: dict[str, int] = {
+    "A": 0, "B": 2, "C": 12, "D": 46, "E": 2, "F": 8, "G": 27, "H": 8,
+    "I": 0, "J": 32, "K": 4, "L": 1, "M": 34, "N": 0, "O": 8, "P": 16,
+    "Q": 10, "R": 6, "S": 3, "T": 28, "U": 36, "V": 10, "W": 6, "X": 16,
+    "Y": 12, "Z": 8,
+}
+# Below this max hp, rest back to full after any damage: one hobgoblin
+# hit (up to 8) is a large part of a 12 hp character.
+_REST_TO_FULL_MAX_HP = 20
+# Steps on a level after which a sleeping ice monster is no longer left
+# alone, in case it is blocking the only way on.
+_ICE_PATIENCE_STEPS = 800
 _ITEM_CHARS = frozenset({"!", "?", ":", ")", "]", "/", "=", ","})
 # What the agent walks over to collect before descending: items and gold.
 _COLLECT_CHARS = _ITEM_CHARS | {"*"}
@@ -302,6 +318,11 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         # whichever neighbouring spot the search was made from.
         self._wall_search_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
         self._level_steps: int = 0  # steps taken on the current level
+        # Set when resting starts; resting then goes on until full hp.
+        self._resting: bool = False
+        # An ice monster has attacked or been attacked on this level.
+        # Ice monsters are not ISMEAN, so one stays asleep unless disturbed.
+        self._ice_awake: bool = False
         # Item tiles (screen row, col) already stepped on this level.  An
         # item still drawn there could not be picked up (full pack), so it
         # is never steered to again.
@@ -354,6 +375,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._search_counts.fill(0)
         self._wall_search_counts.fill(0)
         self._level_steps = 0
+        self._resting = False
+        self._ice_awake = False
         self._item_skip.clear()
         self._prev_pos = None
         self._tile_under_player = "."
@@ -434,6 +457,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             self._search_counts.fill(0)
             self._wall_search_counts.fill(0)
             self._level_steps = 0
+            self._resting = False
+            self._ice_awake = False
             self._item_skip.clear()
             self._zapped_at.clear()
             self._lit_spots.clear()
@@ -508,6 +533,11 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     self._status = parsed_after_auto
                 curr_pos = find_player(lines)
                 screen_arr = screen_to_array(lines)
+
+        if not self._ice_awake:
+            all_text = " ".join(messages).lower()
+            if "ice monster" in all_text or "frozen" in all_text:
+                self._ice_awake = True
 
         self._last_pos = curr_pos
 
@@ -816,6 +846,43 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     return collected
         return collected
 
+    def _try_last_chance_quaff(self) -> tuple[bool, list[str]]:
+        """Drink an untried unknown potion when the next hit could kill.
+
+        That is when hp is at most the largest `_MONSTER_MAX_HIT` among
+        the adjacent monsters.  A gamble: of Rogue 5.4's potions, 25% help
+        in a fight (healing 13, extra healing 5, haste self 5, raise level
+        2) and about 20% hurt (confusion 7, poison 8, blindness 5).
+        Known healing potions are drunk first, by `_try_heal_quaff`.
+        Returns whether a potion was drunk, and the messages.
+        """
+        lines = self.client.get_lines()
+        pos = find_player(lines)
+        if pos is None or self._status.hp <= 0:
+            return False, []
+        ignored = self._ignored_monsters()
+        worst = 0
+        for dr, dc in _MOVE_DELTAS:
+            r, c = pos[0] + dr, pos[1] + dc
+            if 1 <= r <= 22 and 0 <= c < len(lines[r]):
+                ch = lines[r][c]
+                if "A" <= ch <= "Z" and ch not in ignored:
+                    worst = max(worst, _MONSTER_MAX_HIT.get(ch, 8))
+        if self._status.hp > worst:
+            return False, []
+        collected: list[str] = []
+        if self._inventory_dirty:
+            collected.extend(self._refresh_inventory())
+        for slot, desc in list(self._pack.items()):
+            parsed = self._parse_potion(desc)
+            if parsed is None:
+                continue
+            count, kind, color = parsed
+            if kind is None and color not in self._tried_potion_colors:
+                collected.extend(self._quaff_slot(slot, count, color))
+                return True, collected
+        return False, collected
+
     def _try_safe_quaff(self) -> list[str]:
         """Drink known buff potions or (at full health) unknown potions when no monster is in view."""
         for slot, desc in list(self._pack.items()):
@@ -1069,9 +1136,14 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
 
     @staticmethod
     def _find_missile_target(
-        screen_arr: np.ndarray, player_pos: Optional[tuple[int, int]]
+        screen_arr: np.ndarray,
+        player_pos: Optional[tuple[int, int]],
+        skip: frozenset[str] = frozenset(),
     ) -> Optional[str]:
-        """Return the direction key toward the nearest unobstructed aligned monster at dist >= 2."""
+        """Return the direction key toward the nearest unobstructed aligned monster at dist >= 2.
+
+        Monsters in `skip` are never targets; they block the line like a wall.
+        """
         if player_pos is None:
             return None
         pr, pc = player_pos
@@ -1092,6 +1164,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 ch = chr(int(screen_arr[nr, nc]))
                 if ch in _WALL_CHARS or ch == "+":
                     break
+                if ch in skip:
+                    break
                 if "A" <= ch <= "Z":
                     if k >= 2 and (best_dist is None or k < best_dist):
                         best_dist = k
@@ -1107,7 +1181,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         screen_arr = screen_to_array(lines)
         erased_floor = (screen_arr[1:23] == ord(" ")) & self._seen_floor_mask
         screen_arr[1:23][erased_floor] = ord(".")
-        dir_key = self._find_missile_target(screen_arr, player_pos)
+        dir_key = self._find_missile_target(screen_arr, player_pos, self._ignored_monsters())
         if dir_key is None:
             return []
 
@@ -1252,6 +1326,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         """
         status = self._status
         hp_frac = status.hp / status.max_hp if status.max_hp > 0 else 1.0
+        ignored = self._ignored_monsters()
+        targets = [t for t in targets if t[2] not in ignored]
         by_kind: dict[str, tuple[str, str]] = {}
         unknown: list[tuple[str, str]] = []
         for slot, kind, material in sticks:
@@ -1401,10 +1477,28 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 return self._zap(slot, "h")[1]
         return []
 
-    @staticmethod
-    def _monster_in_view(lines: list[str]) -> bool:
-        """True if any monster letter ('A'..'Z') is visible on the dungeon map."""
-        return any("A" <= ch <= "Z" for row in lines[1:23] for ch in row)
+    def _monster_in_view(self, lines: list[str]) -> bool:
+        """True if any monster letter ('A'..'Z') is visible on the dungeon map.
+
+        A sleeping ice monster does not count (see `_ignored_monsters`).
+        """
+        ignored = self._ignored_monsters()
+        return any("A" <= ch <= "Z" and ch not in ignored for row in lines[1:23] for ch in row)
+
+    def _ignored_monsters(self) -> frozenset[str]:
+        """Monster letters to leave alone: an ice monster until it wakes.
+
+        An ice monster does no damage, but each hit freezes the player for
+        2-3 turns, during which it keeps hitting; more than 50 turns frozen
+        is death by hypothermia (fight.c).  It is not ISMEAN, so it never
+        wakes on its own (wake_monster in monsters.c): left alone, it is
+        harmless.  The agent does not attack it, throw at it or count it
+        as a monster in view until an ice monster has been in a fight, or
+        until `_ICE_PATIENCE_STEPS` on the level, in case it blocks the way.
+        """
+        if self._ice_awake or self._level_steps >= _ICE_PATIENCE_STEPS:
+            return frozenset()
+        return frozenset("I")
 
     def _run_auto_actions(self) -> list[str]:
         """Run scripted inventory refresh and auto-equip/quaff/read/missile/ring actions."""
@@ -1417,7 +1511,10 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 zapped, zap_msgs = self._try_zap()
                 collected.extend(zap_msgs)
                 if not zapped:
-                    collected.extend(self._try_throw_missile())
+                    quaffed, quaff_msgs = self._try_last_chance_quaff()
+                    collected.extend(quaff_msgs)
+                    if not quaffed:
+                        collected.extend(self._try_throw_missile())
             return collected
         if self._inventory_dirty:
             collected.extend(self._refresh_inventory())
@@ -1939,6 +2036,21 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         """
         return 6 * (1 + self._level_steps // 500)
 
+    def _wants_rest(self, monster_in_view: bool) -> bool:
+        """Whether to rest now; once started, resting goes on to full hp.
+
+        Resting starts below 60% hp, or after any damage while max hp is
+        under `_REST_TO_FULL_MAX_HP`.  It stops at full hp, or when a
+        monster comes into view or the player gets hungry.
+        """
+        s = self._status
+        if monster_in_view or s.hungry_state != 0 or s.hp >= s.max_hp:
+            self._resting = False
+            return False
+        if s.hp < 0.6 * s.max_hp or s.max_hp < _REST_TO_FULL_MAX_HP:
+            self._resting = True
+        return self._resting
+
     def _map_rows(
         self, screen_arr: np.ndarray, player_pos: Optional[tuple[int, int]]
     ) -> list[str]:
@@ -2149,9 +2261,11 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         if player_pos is not None:
             pr, pc = player_pos
             monster_adjacent = False
-            monster_in_view = bool(
-                np.any((screen_arr[1:23] >= ord("A")) & (screen_arr[1:23] <= ord("Z")))
-            )
+            ignored = self._ignored_monsters()
+            letters = (screen_arr[1:23] >= ord("A")) & (screen_arr[1:23] <= ord("Z"))
+            for ch in ignored:
+                letters &= screen_arr[1:23] != ord(ch)
+            monster_in_view = bool(np.any(letters))
             searchable_adjacent = False
 
             for idx, (dr, dc) in enumerate(_MOVE_DELTAS):
@@ -2160,7 +2274,9 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     mask[idx] = 0
                 else:
                     ch = chr(int(screen_arr[nr, nc]))
-                    if "A" <= ch <= "Z":
+                    if ch in ignored:
+                        mask[idx] = 0  # moving there would attack it
+                    elif "A" <= ch <= "Z":
                         monster_adjacent = True
                     if (
                         ch == " "
@@ -2209,6 +2325,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 and 1 <= pr + dr <= 22
                 and 0 <= pc + dc < 80
                 and "A" <= chr(int(screen_arr[pr + dr, pc + dc])) <= "Z"
+                and chr(int(screen_arr[pr + dr, pc + dc])) not in ignored
             ]
             if attack_moves:
                 mask[:] = 0
@@ -2247,9 +2364,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 elif self._steer(mask, player_pos, self._stairs_distances(screen_arr)):
                     pass
                 elif (
-                    self._status.hp < 0.6 * self._status.max_hp
-                    and not monster_in_view
-                    and self._status.hungry_state == 0
+                    self._wants_rest(monster_in_view)
                     and self._tile_under_player not in _ITEM_CHARS
                 ):
                     mask[:] = 0
