@@ -2204,3 +2204,69 @@ def test_waits_once_for_an_approaching_monster_two_squares_away() -> None:
     # Having waited once, the agent is free to act again.
     obs, _, _, _, _ = env.step(9)
     assert _legal(obs["action_mask"]) != ["s"]
+
+
+def test_rests_by_searching_below_level_one() -> None:
+    lines = _with(_room(), 23, 0, _status_line(level=2, hp=5, max_hp=12))
+    env = _fake_env({"s": lines}, lines)
+    env._status = parse_status(lines[23]) or RogueStatus()
+    assert _legal(env._compute_action_mask(screen_to_array(lines), (5, 5))) == ["s"]
+    env._last_pos = (5, 5)
+    env.step(9)
+    assert env._search_counts[4, 5] == 1
+    assert env._wall_search_counts[3:6, 4:7].min() == 1
+
+    level_one = _with(_room(), 23, 0, _status_line(level=1, hp=5, max_hp=12))
+    env1 = _fake_env({}, level_one)
+    env1._status = parse_status(level_one[23]) or RogueStatus()
+    assert _legal(env1._compute_action_mask(screen_to_array(level_one), (5, 5))) == ["."]
+
+
+def _sleeper_room(
+    letter: str, hp: int = 12, max_hp: int = 12
+) -> tuple[RogueEnv, list[str]]:
+    """A fully explored lit room, no stairs, a monster asleep at (5, 8)."""
+    lines = _with(_with(_wide_room(), 5, 8, letter), 23, 0, _status_line(hp=hp, max_hp=max_hp))
+    env = _explored_env(lines)
+    env._status = parse_status(lines[23]) or RogueStatus()
+    env._monster_tiles = {(5, 8): letter}
+    env._sightings = {(5, 8): (letter, 3)}
+    return env, lines
+
+
+def test_a_monster_seen_twice_in_place_is_taken_as_asleep() -> None:
+    still = _with(_room(), 5, 8, "H")
+    env = _fake_env({".": still}, still)
+    env._last_pos = (5, 5)
+    env.step(8)
+    assert env._sleeping_monsters((5, 5)) == {}  # seen once
+    env.step(8)
+    assert env._sleeping_monsters((5, 5)) == {(5, 8): "H"}
+    assert env._sleeping_monsters((5, 7)) == {}  # adjacent never counts
+
+    moved = _with(_room(), 5, 7, "H")
+    env.client._screens["."] = moved
+    env.step(8)
+    assert env._sightings[(5, 7)] == ("H", 0)
+
+
+def test_a_sleeper_does_not_stop_resting() -> None:
+    env, lines = _sleeper_room("H", hp=5)
+    assert _legal(env._compute_action_mask(screen_to_array(lines), (5, 5))) == ["."]
+
+
+def test_with_nothing_left_goes_to_wake_a_sleeper_that_may_hide_the_stairs() -> None:
+    env, lines = _sleeper_room("H", hp=12)
+    legal = _legal(env._compute_action_mask(screen_to_array(lines), (5, 5)))
+    assert legal and set(legal) <= {"l", "u", "n"}  # toward it
+
+    # Not one that could kill in one hit, not one left asleep on purpose,
+    # and not with the stairs in sight.
+    env, lines = _sleeper_room("H", hp=8, max_hp=8)
+    assert "h" in _legal(env._compute_action_mask(screen_to_array(lines), (5, 5)))
+    env, lines = _sleeper_room("C", hp=12)
+    assert "h" in _legal(env._compute_action_mask(screen_to_array(lines), (5, 5)))
+    env, lines = _sleeper_room("H", hp=12)
+    with_stairs = _with(lines, 4, 2, "%")
+    legal = _legal(env._compute_action_mask(screen_to_array(with_stairs), (5, 5)))
+    assert legal and set(legal) <= {"h", "y", "b"}  # to the stairs instead

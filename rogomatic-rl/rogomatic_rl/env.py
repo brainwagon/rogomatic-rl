@@ -93,6 +93,10 @@ _MONSTER_NAMES: dict[str, str] = {
 # Steps on a level after which sleeping monsters are no longer left
 # alone, in case one is blocking the only way on.
 _SLEEPER_PATIENCE_STEPS = 800
+# With no stairs found after this many steps on a level, go and wake a
+# sleeping monster even while some walls are still to be searched: the
+# stairs may be under it (#33).
+_SLEEPER_STAIRS_STEPS = 500
 _ITEM_CHARS = frozenset({"!", "?", ":", ")", "]", "/", "=", ","})
 # What the agent walks over to collect before descending: items and gold.
 _COLLECT_CHARS = _ITEM_CHARS | {"*"}
@@ -365,6 +369,11 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         # tile in the last step, with the distance they came from.
         self._monster_tiles: dict[tuple[int, int], str] = {}
         self._approaching: dict[tuple[int, int], int] = {}
+        # Per tile: the monster letter last seen there, and how many times
+        # it has been seen there without moving (0 if it just moved in).
+        # Kept while the tile is out of sight, so a sleeper seen again
+        # from a doorway is still known.
+        self._sightings: dict[tuple[int, int], tuple[str, int]] = {}
         # The mask allowed only waiting for an approaching monster, and
         # the agent has just waited once (`_lie_in_wait`).
         self._wait_forced: bool = False
@@ -1663,6 +1672,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._awake_letters.clear()
         self._monster_tiles = {}
         self._approaching = {}
+        self._sightings = {}
         self._wait_forced = False
         self._lying_in_wait = False
 
@@ -1701,6 +1711,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         rows, cols = np.nonzero((dungeon >= ord("A")) & (dungeon <= ord("Z")))
         now = {(int(r) + 1, int(c)): chr(int(dungeon[r, c])) for r, c in zip(rows, cols)}
         approaching: dict[tuple[int, int], int] = {}
+        moved: set[tuple[int, int]] = set()
         if same_level:
             for pos, letter in now.items():
                 if self._monster_tiles.get(pos) == letter:
@@ -1712,13 +1723,77 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                         and max(abs(old[0] - pos[0]), abs(old[1] - pos[1])) <= 2
                     ):
                         self._awake_letters.add(letter)
+                        moved.add(pos)
                         if curr_pos is not None:
                             approaching[pos] = max(
                                 abs(old[0] - curr_pos[0]), abs(old[1] - curr_pos[1])
                             )
                         break
+        for pos, letter in now.items():
+            seen_letter, count = self._sightings.get(pos, ("", 0))
+            if pos in moved:
+                count = 0
+            elif seen_letter == letter:
+                count += 1
+            else:
+                count = 1
+            self._sightings[pos] = (letter, count)
         self._monster_tiles = now
         self._approaching = approaching
+
+    def _sleeping_monsters(
+        self, player_pos: Optional[tuple[int, int]]
+    ) -> dict[tuple[int, int], str]:
+        """Visible monsters that look asleep: seen twice on their tile, not adjacent.
+
+        Rogue wakes a mean monster only 2 times in 3 when the player
+        enters its lit room or moves next to it (door_open in move.c,
+        look in misc.c), so sleeping monsters in view are common.  One
+        that stays put is treated as asleep, as Rog-O-Matic does
+        (sleepmonster in monsters.c there).  Adjacent ones never count:
+        an awake monster next to the player also stands still.
+        """
+        if player_pos is None:
+            return {}
+        pr, pc = player_pos
+        return {
+            pos: letter
+            for pos, letter in self._monster_tiles.items()
+            if self._sightings.get(pos, ("", 0))[1] >= 2
+            and self._sightings[pos][0] == letter
+            and max(abs(pos[0] - pr), abs(pos[1] - pc)) > 1
+        }
+
+    def _steer_to_sleeper(
+        self, mask: np.ndarray, screen_arr: np.ndarray, player_pos: tuple[int, int]
+    ) -> bool:
+        """With no stairs in sight, walk up to a sleeping monster to fight it.
+
+        A monster standing on the stairs hides them, and a sleeping one
+        can stand there for good.  Rog-O-Matic, after failing to find the
+        stairs, attacks sleeping monsters for this reason (strategize in
+        strategy.c there, "No stairs, attacking sleeping monster").  It
+        also clears a doorway a sleeper blocks.  Only monsters the player
+        can survive one maximum hit from, never an ice monster, and not
+        the ones `_ignored_monsters` leaves alone.  The attack itself
+        comes from the fight-back rule once the agent is adjacent.
+        Returns False, leaving `mask` unchanged, when there is no such
+        monster in reach.
+        """
+        if np.any(screen_arr[1:23] == ord("%")):
+            return False
+        ignored = self._ignored_monsters()
+        hp = self._status.hp
+        goals = [
+            pos
+            for pos, letter in self._sleeping_monsters(player_pos).items()
+            if letter not in ignored
+            and letter != "I"
+            and hp > _MONSTER_MAX_HIT.get(letter, 8)
+        ]
+        if not goals:
+            return False
+        return self._steer(mask, player_pos, self._path_distances(screen_arr, goals, avoid=frozenset("^")))
 
     def _run_auto_actions(self) -> list[str]:
         """Run scripted inventory refresh and auto-equip/quaff/read/missile/ring actions."""
@@ -2289,6 +2364,17 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         """
         return 6 * (1 + self._level_steps // 500)
 
+    def _rest_action(self) -> int:
+        """The action to rest with: search ('s') where something could be hidden.
+
+        Rog-O-Matic always rests by searching (restup in tactics.c there).
+        A search takes the same turn, still heals (doctor in daemons.c
+        counts every quiet turn) and may find a secret door or corridor
+        next to the player.  Level 1 hides nothing (#25), so there it is
+        '.'.
+        """
+        return 9 if self._status.level >= 2 else 8
+
     def _wants_rest(self, monster_in_view: bool) -> bool:
         """Whether to rest now; once started, resting goes on to full hp.
 
@@ -2519,6 +2605,10 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             letters = (screen_arr[1:23] >= ord("A")) & (screen_arr[1:23] <= ord("Z"))
             for ch in ignored:
                 letters &= screen_arr[1:23] != ord(ch)
+            # Sleeping monsters do not stop resting, collecting, exploring
+            # or searching; paths still go around them (#33).
+            for r, c in self._sleeping_monsters(player_pos):
+                letters[r - 1, c] = False
             monster_in_view = bool(np.any(letters))
             searchable_adjacent = False
 
@@ -2558,7 +2648,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     and self._status.hungry_state == 0
                 ):
                     mask[:] = 0
-                    mask[8] = 1
+                    mask[self._rest_action()] = 1
                     return mask
                 to_item = mask.copy()
                 to_item[8:] = 0
@@ -2589,7 +2679,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             if self._lie_in_wait(player_pos, ignored):
                 self._wait_forced = True
                 mask[:] = 0
-                mask[9 if self._status.level >= 2 else 8] = 1
+                mask[self._rest_action()] = 1
                 return mask
 
             # Mask '.' (rest) when at full HP with no adjacent monster
@@ -2628,7 +2718,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     and self._tile_under_player not in _ITEM_CHARS
                 ):
                     mask[:] = 0
-                    mask[8] = 1
+                    mask[self._rest_action()] = 1
                     return mask
                 elif not monster_in_view and self._steer(
                     mask, player_pos, self._frontier_distances(screen_arr)
@@ -2638,6 +2728,12 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     # view: one seen only from a doorway would otherwise
                     # switch the two rules back and forth.
                     pass
+                elif (
+                    not monster_in_view
+                    and self._level_steps >= _SLEEPER_STAIRS_STEPS
+                    and self._steer_to_sleeper(mask, screen_arr, player_pos)
+                ):
+                    pass  # long on this level: the stairs may be under a sleeper
                 elif (
                     secrets_possible
                     and not monster_in_view
@@ -2659,6 +2755,10 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     # No dead ends left either: search the room walls that
                     # could hide a door, those facing unexplored cells first.
                     pass
+                elif not monster_in_view and self._steer_to_sleeper(
+                    mask, screen_arr, player_pos
+                ):
+                    pass  # nothing left to search: the stairs may be under a sleeper
                 else:
                     # 1. Corridor / doorway forward flow: avoid immediate U-turns unless at a dead end;
                     # at a '#' corridor dead end, finish searching up to the cap before turning back.
