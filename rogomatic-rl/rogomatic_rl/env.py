@@ -195,6 +195,33 @@ _MISSILE_BASE_DAMAGE: dict[str, float] = {
     "dart": 2.0,      # 1d3
     "arrow": 1.0,     # 1d1 without short bow in hand
 }
+# Wand and staff pack entries (nameit in things.c).  Charges show only once
+# the stick itself is identified: "A wand of fire [4 charges](brass)".
+_KNOWN_STICK_RE = re.compile(
+    r"^an?\s+(?:wand|staff)\s+of\s+([a-z ]+?)(?:\s+\[(\d+)(?:\s+charges)?\])?\(([a-z ]+)\)$",
+    re.IGNORECASE,
+)
+_CALLED_STICK_RE = re.compile(
+    r"^an?\s+(?:wand|staff)\s+called\s+.+?\(([a-z ]+)\)$", re.IGNORECASE
+)
+_UNKNOWN_STICK_RE = re.compile(r"^an?\s+([a-z ]+?)\s+(?:wand|staff)$", re.IGNORECASE)
+# Bolts travel BOLT_LENGTH tiles (rogue.h) and bounce off walls and doors;
+# a bounce within 3 tiles can come back and hit the hero for 6d6.
+_BOLT_STICKS = ("lightning", "fire", "cold")
+_BOLT_LENGTH = 6
+_BOLT_MIN_BOUNCE = 4
+# Monsters whose special attacks cancellation removes (fight.c, monsters.c):
+# aquator and rust monster rust armour, venus flytrap holds, ice monster
+# freezes, leprechaun and nymph steal, medusa confuses, vampire and wraith
+# drain.
+_CANCEL_LETTERS = frozenset("AFILMNRVW")
+# Food pack entries (inv_name in things.c): "Some food", "3 rations of
+# food", "A slime-mold", "2 slime-molds".
+_FOOD_COUNT_RE = re.compile(
+    r"^(?:some food|an?\s+slime-mold|(\d+)\s+(?:rations of food|slime-molds))$",
+    re.IGNORECASE,
+)
+
 _DEFAULT_PACK: dict[str, str] = {
     "a": "Some food",
     "b": "+1 ring mail [4] (being worn)",
@@ -262,6 +289,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._visited_mask: np.ndarray = np.zeros((22, 80), dtype=bool)
         self._visit_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
         self._search_counts: np.ndarray = np.zeros((22, 80), dtype=np.int32)
+        self._level_steps: int = 0  # steps taken on the current level
         # Item tiles (screen row, col) already stepped on this level.  An
         # item still drawn there could not be picked up (full pack), so it
         # is never steered to again.
@@ -282,6 +310,19 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._known_potion_colors: dict[str, str] = {}
         self._tried_scroll_keys: set[str] = set()
         self._known_scroll_titles: dict[str, str] = {}
+        # Stick materials Rogue has named (material -> kind), and materials
+        # zapped once to identify them.  A stick Rogue does not name on use
+        # stays unknown, so it is not zapped again.
+        self._stick_kinds: dict[str, str] = {}
+        self._tried_stick_materials: set[str] = set()
+        # Slots found out of charges ("nothing happens"), with the entry then.
+        self._empty_sticks: dict[str, str] = {}
+        # (kind, monster letter) already slowed or cancelled on this level.
+        self._zapped_at: set[tuple[str, str]] = set()
+        # Where a light stick was zapped on this level.
+        self._lit_spots: list[tuple[int, int]] = []
+        # A wand or staff entered the pack since the last inventory listing.
+        self._stick_picked_up: bool = False
         # How the current episode ended: None while it is running.
         self._end: Optional[str] = None
         self._killed_by: Optional[str] = None
@@ -299,6 +340,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._visited_mask.fill(False)
         self._visit_counts.fill(0)
         self._search_counts.fill(0)
+        self._level_steps = 0
         self._item_skip.clear()
         self._prev_pos = None
         self._tile_under_player = "."
@@ -316,6 +358,12 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._known_potion_colors = {}
         self._tried_scroll_keys = set()
         self._known_scroll_titles = {}
+        self._stick_kinds = {}
+        self._tried_stick_materials = set()
+        self._empty_sticks = {}
+        self._zapped_at = set()
+        self._lit_spots = []
+        self._stick_picked_up = False
         self._end = None
         self._killed_by = None
 
@@ -348,6 +396,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             raise ValueError(f"Invalid action {action!r}")
 
         self._steps += 1
+        self._level_steps += 1
         action_idx = int(action)
         messages = self.client.send_key(ACTIONS[action_idx])
         lines = self.client.get_lines()
@@ -370,7 +419,10 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             self._visited_mask.fill(False)
             self._visit_counts.fill(0)
             self._search_counts.fill(0)
+            self._level_steps = 0
             self._item_skip.clear()
+            self._zapped_at.clear()
+            self._lit_spots.clear()
             self._prev_pos = None
             self._tile_under_player = "."
         elif curr_pos is not None and curr_pos != prev_pos:
@@ -410,6 +462,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             self._has_food = True
         if any(_PICKUP_RE.search(m) for m in messages):
             self._inventory_dirty = True
+            if re.search(r"\b(?:wand|staff)\b", msg_text):
+                self._stick_picked_up = True
 
         ate_food = False
         if (
@@ -571,6 +625,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             eat_msgs = self.client.send_key(slot)
             collected.extend(eat_msgs)
             ate = bool(_ATE_RE.search(" ".join(eat_msgs).lower()))
+            self._inventory_dirty = True
 
         # Leave the game at the command prompt whatever happened above.
         collected.extend(self._dismiss_overlay())
@@ -1086,6 +1141,249 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 self._pack.pop(best_slot, None)
         return collected
 
+    def _food_count(self) -> int:
+        """Rations and slime-molds in the pack, as last listed."""
+        total = 0
+        for desc in self._pack.values():
+            match = _FOOD_COUNT_RE.match(desc.strip())
+            if match:
+                total += int(match.group(1)) if match.group(1) else 1
+        return total
+
+    def _parse_stick(self, desc: str) -> Optional[tuple[Optional[str], str, Optional[int]]]:
+        """Parse a wand or staff pack entry into (kind, material, charges).
+
+        `kind` is None while the stick is unidentified (a material named
+        earlier in the game counts as identified); `charges` is None
+        unless Rogue shows them.
+        """
+        clean = desc.strip()
+        match = _KNOWN_STICK_RE.match(clean)
+        if match:
+            kind = match.group(1).strip().lower()
+            material = match.group(3).strip().lower()
+            self._stick_kinds[material] = kind
+            charges = int(match.group(2)) if match.group(2) is not None else None
+            return kind, material, charges
+        match = _CALLED_STICK_RE.match(clean) or _UNKNOWN_STICK_RE.match(clean)
+        if match:
+            material = match.group(1).strip().lower()
+            return self._stick_kinds.get(material), material, None
+        return None
+
+    def _usable_sticks(self) -> list[tuple[str, Optional[str], str]]:
+        """(slot, kind, material) for each stick that may still have charges."""
+        out = []
+        for slot, desc in sorted(self._pack.items()):
+            parsed = self._parse_stick(desc)
+            if parsed is None:
+                continue
+            kind, material, charges = parsed
+            if charges == 0 or self._empty_sticks.get(slot) == desc:
+                continue
+            out.append((slot, kind, material))
+        return out
+
+    @staticmethod
+    def _zap_targets(
+        screen_arr: np.ndarray, player_pos: tuple[int, int]
+    ) -> list[tuple[int, int, str, int]]:
+        """The first monster along each of the 8 directions a stick can aim.
+
+        Returns (direction index, distance, monster letter, bounce), where
+        `bounce` is the distance to the first wall or door a bolt would
+        bounce off (fire_bolt in sticks.c), or a large number if none is
+        within a bolt's reach.  Rays pass doors and items and stop at the
+        first monster or wall (step_ok in io.c).
+        """
+        pr, pc = player_pos
+        targets = []
+        for idx, (dr, dc) in enumerate(_MOVE_DELTAS):
+            target: Optional[tuple[int, str]] = None
+            bounce = 99
+            for k in range(1, 80):
+                nr, nc = pr + k * dr, pc + k * dc
+                ch = (
+                    chr(int(screen_arr[nr, nc]))
+                    if 1 <= nr <= 22 and 0 <= nc < 80
+                    else " "
+                )
+                if ch in _WALL_CHARS or ch == "+":
+                    bounce = min(bounce, k)
+                    if ch != "+":
+                        break
+                if target is None and "A" <= ch <= "Z":
+                    target = (k, ch)
+                if target is not None and k >= _BOLT_LENGTH:
+                    break
+            if target is not None:
+                targets.append((idx, target[0], target[1], bounce))
+        return targets
+
+    def _choose_zap(
+        self,
+        sticks: list[tuple[str, Optional[str], str]],
+        targets: list[tuple[int, int, str, int]],
+    ) -> Optional[tuple[str, Optional[str], str, tuple[int, int, str, int]]]:
+        """Pick (slot, kind, material, target) to zap now, or None.
+
+        In order: teleport away when hurt, cancellation against a monster
+        with a special attack, a bolt that cannot bounce back, slow
+        monster when hurt, magic missile, polymorph as a last resort, then
+        an unknown stick to identify it while healthy.  Haste monster,
+        invisibility, teleport to, drain life and nothing are never used.
+        """
+        status = self._status
+        hp_frac = status.hp / status.max_hp if status.max_hp > 0 else 1.0
+        by_kind: dict[str, tuple[str, str]] = {}
+        unknown: list[tuple[str, str]] = []
+        for slot, kind, material in sticks:
+            if kind is None:
+                if material not in self._tried_stick_materials:
+                    unknown.append((slot, material))
+            else:
+                by_kind.setdefault(kind, (slot, material))
+
+        def nearest(cands: list[tuple[int, int, str, int]]) -> Optional[tuple[int, int, str, int]]:
+            return min(cands, key=lambda t: t[1]) if cands else None
+
+        def pick(kind: str, cands: list[tuple[int, int, str, int]]):
+            if kind not in by_kind:
+                return None
+            target = nearest(cands)
+            if target is None:
+                return None
+            slot, material = by_kind[kind]
+            return slot, kind, material, target
+
+        bolt_safe = [
+            t for t in targets if t[1] <= _BOLT_LENGTH and t[3] >= _BOLT_MIN_BOUNCE
+        ]
+        choices = []
+        if hp_frac < 0.4:
+            choices.append(pick("teleport away", targets))
+        choices.append(
+            pick(
+                "cancellation",
+                [
+                    t
+                    for t in targets
+                    if t[2] in _CANCEL_LETTERS and ("cancellation", t[2]) not in self._zapped_at
+                ],
+            )
+        )
+        for kind in _BOLT_STICKS:
+            cands = [t for t in bolt_safe if not (kind == "fire" and t[2] == "D")]
+            choices.append(pick(kind, cands))
+        if hp_frac < 0.6:
+            choices.append(
+                pick(
+                    "slow monster",
+                    [t for t in targets if ("slow monster", t[2]) not in self._zapped_at],
+                )
+            )
+        choices.append(pick("magic missile", targets))
+        if hp_frac < 0.25:
+            choices.append(pick("polymorph", [t for t in targets if t[1] == 1]))
+        for choice in choices:
+            if choice is not None:
+                return choice
+
+        # Identify an unknown stick on a monster at range while healthy:
+        # drain life halves hp, teleport to brings the monster adjacent,
+        # and a bolt must not be able to bounce back.
+        if unknown and hp_frac >= 0.7:
+            target = nearest([t for t in bolt_safe if t[1] >= 2])
+            if target is not None:
+                slot, material = unknown[0]
+                return slot, None, material, target
+        return None
+
+    def _current_screen(self) -> tuple[np.ndarray, Optional[tuple[int, int]]]:
+        """The live screen with erased dark-room floor restored, and the player."""
+        lines = self.client.get_lines()
+        screen_arr = screen_to_array(lines)
+        erased_floor = (screen_arr[1:23] == ord(" ")) & self._seen_floor_mask
+        screen_arr[1:23][erased_floor] = ord(".")
+        return screen_arr, find_player(lines)
+
+    def _zap(self, slot: str, dir_key: str) -> tuple[bool, list[str]]:
+        """Zap the stick in `slot` toward `dir_key`; True if a turn was used.
+
+        An empty stick ("nothing happens") still uses the turn, and is
+        remembered so it is not zapped again.
+        """
+        desc = self._pack.get(slot, "")
+        collected = self.client.send_key(f"z{dir_key}")
+        zap_msgs = self.client.send_key(slot)
+        collected.extend(zap_msgs)
+        top = self.client.get_lines()[0].lower()
+        if "zap with" in top or "direction" in top:
+            collected.extend(self.client.send_key("\x1b"))
+            self._empty_sticks[slot] = desc
+            return False, collected
+        self._inventory_dirty = True
+        if "nothing happens" in " ".join(zap_msgs).lower():
+            self._empty_sticks[slot] = desc
+        return True, collected
+
+    def _try_zap(self) -> tuple[bool, list[str]]:
+        """Zap a wand or staff at a monster in line, if one is worth it.
+
+        Returns whether a game turn was used, and the messages.
+        """
+        screen_arr, player_pos = self._current_screen()
+        if player_pos is None:
+            return False, []
+        targets = self._zap_targets(screen_arr, player_pos)
+        if not targets:
+            return False, []
+        collected: list[str] = []
+        has_stick = any(self._parse_stick(d) for d in self._pack.values())
+        if self._inventory_dirty and (has_stick or self._stick_picked_up):
+            collected.extend(self._refresh_inventory())
+            self._stick_picked_up = False
+        choice = self._choose_zap(self._usable_sticks(), targets)
+        if choice is None:
+            return False, collected
+        slot, kind, material, (dir_idx, _dist, letter, _bounce) = choice
+        if kind is None:
+            self._tried_stick_materials.add(material)
+        elif kind in ("slow monster", "cancellation"):
+            self._zapped_at.add((kind, letter))
+        used, msgs = self._zap(slot, ACTIONS[dir_idx])
+        collected.extend(msgs)
+        if kind is None and used:
+            # Rogue names light, bolts, magic missile and (when seen)
+            # polymorph on use; listing the pack takes no game turn.
+            collected.extend(self._refresh_inventory())
+        return used, collected
+
+    def _in_dark_room(self, player_pos: tuple[int, int]) -> bool:
+        """True when standing on room floor that Rogue erases behind the player."""
+        if self._tile_under_player != "." or not (1 <= player_pos[0] <= 22):
+            return False
+        raw = screen_to_array(self.client.get_lines())[1:23]
+        erased = (raw == ord(" ")) & self._seen_floor_mask
+        r, c = player_pos[0] - 1, player_pos[1]
+        return bool(np.any(erased[max(0, r - 3) : r + 4, max(0, c - 3) : c + 4]))
+
+    def _try_light(self) -> list[str]:
+        """Light a dark room with a known light stick, once per spot."""
+        _, player_pos = self._current_screen()
+        if player_pos is None or not self._in_dark_room(player_pos):
+            return []
+        if any(
+            max(abs(player_pos[0] - r), abs(player_pos[1] - c)) <= 5
+            for r, c in self._lit_spots
+        ):
+            return []
+        for slot, kind, _material in self._usable_sticks():
+            if kind == "light":
+                self._lit_spots.append(player_pos)
+                return self._zap(slot, "h")[1]
+        return []
+
     @staticmethod
     def _monster_in_view(lines: list[str]) -> bool:
         """True if any monster letter ('A'..'Z') is visible on the dungeon map."""
@@ -1099,7 +1397,10 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             escaped = self._try_emergency_scroll()
             collected.extend(escaped)
             if not escaped:
-                collected.extend(self._try_throw_missile())
+                zapped, zap_msgs = self._try_zap()
+                collected.extend(zap_msgs)
+                if not zapped:
+                    collected.extend(self._try_throw_missile())
             return collected
         if self._inventory_dirty:
             collected.extend(self._refresh_inventory())
@@ -1110,6 +1411,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         collected.extend(quaffed)
         if not quaffed:
             collected.extend(self._try_read_scrolls())
+        collected.extend(self._try_light())
         return collected
 
     def _ring_value(
@@ -1286,8 +1588,16 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         """Manage putting on, upgrading, and removing rings out of combat."""
         collected: list[str] = []
         starving = self._status.hungry_state >= 1 and not self._has_food
+        # Regeneration burns food three times as fast (ring_eat in rings.c),
+        # so it is worn only with two rations or more in the pack.
+        food_short = self._food_count() < 2
 
-        # 1. Remove any worn uncursed rings that are harmful (< 0) or draining food when starving.
+        def unwanted(kind: str) -> bool:
+            return (starving and kind != "slow digestion") or (
+                food_short and kind == "regeneration"
+            )
+
+        # 1. Remove any worn uncursed rings that are harmful (< 0) or draining food when short.
         for hand in ("left", "right"):
             if self._ring_cursed.get(hand, False):
                 continue
@@ -1299,9 +1609,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             if hand not in worn_items:
                 continue
             slot, kind, _stone, score = worn_items[hand]
-            should_remove = score < 0.0 or (
-                starving and kind not in ("slow digestion", "regeneration")
-            )
+            should_remove = score < 0.0 or unwanted(kind)
             if should_remove:
                 _, msgs = self._remove_ring(hand, slot, both_worn=len(worn_items) == 2)
                 collected.extend(msgs)
@@ -1317,9 +1625,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 kind, stone, hand, score = parsed
                 if hand is not None:
                     worn[hand] = (slot, kind, stone, score)
-                elif score > 0.0 and (
-                    not starving or kind in ("slow digestion", "regeneration")
-                ):
+                elif score > 0.0 and not unwanted(kind):
                     unworn.append((score, slot, kind, stone))
 
             if not unworn:
@@ -1549,6 +1855,67 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             return {}
         return self._path_distances(screen_arr, goals, avoid=frozenset("^"))
 
+    def _frontier_distances(self, screen_arr: np.ndarray) -> dict[tuple[int, int], int]:
+        """Shortest-path step distances to the nearest unexplored frontier.
+
+        The frontier is every seen tile the player has not stood on that
+        leads somewhere new: a corridor or door tile, or room floor next
+        to a tile never seen (the edge of a dark room).  Paths avoid
+        known traps.
+        """
+        dungeon = screen_arr[1:23]
+        unseen = np.pad(~self._seen_mask, 1, constant_values=False)
+        next_to_unseen = (
+            unseen[:-2, 1:-1] | unseen[2:, 1:-1] | unseen[1:-1, :-2] | unseen[1:-1, 2:]
+        )
+        frontier = ~self._visited_mask & (
+            (dungeon == ord("#"))
+            | (dungeon == ord("+"))
+            | ((dungeon == ord(".")) & next_to_unseen)
+        )
+        rows, cols = np.nonzero(frontier)
+        if len(rows) == 0:
+            return {}
+        goals = [(int(r) + 1, int(c)) for r, c in zip(rows, cols)]
+        return self._path_distances(screen_arr, goals, avoid=frozenset("^"))
+
+    def _dead_end_distances(
+        self, screen_arr: np.ndarray, player_pos: tuple[int, int]
+    ) -> dict[tuple[int, int], int]:
+        """Distances to corridor dead ends not yet searched the full 6 times.
+
+        Corridors in Rogue lead somewhere, so a dead end usually hides a
+        passage.  Empty when the player is standing on one, so the dead-end
+        search rule can act there.
+        """
+        dungeon = screen_arr[1:23]
+        corridor = dungeon == ord("#")
+        pr, pc = player_pos
+        if 1 <= pr <= 22:
+            corridor[pr - 1, pc] = self._tile_under_player == "#"
+        walkable = np.pad(
+            ~np.isin(dungeon, [ord(" "), ord("-"), ord("|")]), 1, constant_values=False
+        )
+        neighbours = sum(
+            walkable[1 + dr : 23 + dr, 1 + dc : 81 + dc].astype(np.int8)
+            for dr, dc in _MOVE_DELTAS
+        )
+        dead_end = corridor & (neighbours == 1) & (self._search_counts < self._search_cap())
+        rows, cols = np.nonzero(dead_end)
+        goals = [(int(r) + 1, int(c)) for r, c in zip(rows, cols)]
+        if not goals or player_pos in goals:
+            return {}
+        return self._path_distances(screen_arr, goals, avoid=frozenset("^"))
+
+    def _search_cap(self) -> int:
+        """Searches allowed per spot: 6, and 6 more for every 500 steps on the level.
+
+        Six searches find a secret door with about 74% chance (1 in 5 each,
+        search in command.c), so a level with no stairs found after a long
+        time gets searched again.
+        """
+        return 6 * (1 + self._level_steps // 500)
+
     @staticmethod
     def _steer(
         mask: np.ndarray, pos: tuple[int, int], dist: dict[tuple[int, int], int]
@@ -1652,11 +2019,11 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             if self._status.hp >= self._status.max_hp and not monster_adjacent:
                 mask[8] = 0
 
-            # Mask 's' (search) unless next to a wall / corridor dead-end and searched < 6 times
+            # Mask 's' (search) unless next to a wall / corridor dead-end and under the search cap
             curr_searches = (
                 int(self._search_counts[pr - 1, pc]) if 1 <= pr <= 22 else 0
             )
-            if not searchable_adjacent or curr_searches >= 6:
+            if not searchable_adjacent or curr_searches >= self._search_cap():
                 mask[9] = 0
 
             # Anti-oscillation & dead-end / room-corner escape when not in combat
@@ -1680,6 +2047,18 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     mask[:] = 0
                     mask[8] = 1
                     return mask
+                elif not monster_in_view and self._steer(
+                    mask, player_pos, self._frontier_distances(screen_arr)
+                ):
+                    # Explore toward the nearest unexplored corridor, door or
+                    # dark floor.  Like item steering, not with a monster in
+                    # view: one seen only from a doorway would otherwise
+                    # switch the two rules back and forth.
+                    pass
+                elif self._steer(
+                    mask, player_pos, self._dead_end_distances(screen_arr, player_pos)
+                ):
+                    pass  # nothing left to explore: go and search a dead end
                 else:
                     # 1. Corridor / doorway forward flow: avoid immediate U-turns unless at a dead end;
                     # at a '#' corridor dead end, finish searching up to the cap before turning back.

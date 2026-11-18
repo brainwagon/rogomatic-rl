@@ -164,8 +164,15 @@ def test_breadcrumbs_and_anti_oscillation_mask() -> None:
         assert mask[3] == 1
         assert mask[0] == 0
 
-        # Search ('s', idx 9) is valid up to 6 times at a corridor bordering blank space, then masked
-        assert mask[9] == 1
+        # The unvisited corridor ahead is the frontier, so exploring it comes before searching
+        assert mask[9] == 0
+
+        # With nothing left to explore (both ends visited and searched out), search ('s', idx 9)
+        # is valid up to 6 times at a corridor bordering blank space, then masked
+        env._visited_mask[4, 6] = True
+        env._search_counts[4, 4] = 6
+        env._search_counts[4, 6] = 6
+        assert env._compute_action_mask(screen_arr, (5, 5))[9] == 1
         env._search_counts[4, 5] = 6
         mask_after_search = env._compute_action_mask(screen_arr, (5, 5))
         assert mask_after_search[9] == 0
@@ -947,6 +954,7 @@ def test_failed_descend_clears_stairs_tile_and_corridor_dead_end_searches_before
     env2 = _fake_env({}, dead_end)
     env2._tile_under_player = "#"
     env2._prev_pos = (5, 4)
+    env2._visited_mask[4, 4:6] = True  # walked (5, 4) -> (5, 5)
     mask_before = env2._compute_action_mask(screen_to_array(dead_end), (5, 5))
     assert list(np.flatnonzero(mask_before)) == [9]
 
@@ -1168,6 +1176,7 @@ def test_auto_rings_puts_on_replaces_and_handles_cursed_and_starvation() -> None
     env._status = parse_status(room[23]) or RogueStatus()
     env._safe_ring_stones.add("agate")  # known removable: no probe in this flow
     env._pack = {
+        "a": "2 rations of food",  # regeneration is worn only with food to spare
         "f": "An agate ring",
         "g": "A ring of protection [+1](ruby)",
     }
@@ -1616,6 +1625,7 @@ def test_item_left_after_stepping_on_it_is_skipped_until_the_next_level() -> Non
     assert (5, 6) in env._item_skip
 
     # Back where it started, the scroll at (5, 6) no longer attracts.
+    env._seen_mask[:] = True  # the room is fully explored
     mask = env._compute_action_mask(screen_to_array(before), (5, 5))
     assert "h" in _legal(mask)
 
@@ -1645,3 +1655,211 @@ def test_weak_with_no_food_only_food_is_worth_a_detour() -> None:
     mask = env._compute_action_mask(screen_to_array(lines), (5, 5))
 
     assert set(_legal(mask)) <= {"l", "u", "n"}
+
+
+# --- Wands and staffs (#21) ---
+
+
+def test_parse_stick_entries() -> None:
+    env = _fake_env({}, _room())
+    assert env._parse_stick("A wand of fire [4 charges](brass)") == ("fire", "brass", 4)
+    assert env._parse_stick("A staff of slow monster(avocado wood)") == (
+        "slow monster",
+        "avocado wood",
+        None,
+    )
+    # The material is now known, so an unnamed stick of it is identified.
+    assert env._parse_stick("An avocado wood staff") == ("slow monster", "avocado wood", None)
+    assert env._parse_stick("An iron wand") == (None, "iron", None)
+    assert env._parse_stick("A wand called zappy(iron)") == (None, "iron", None)
+    assert env._parse_stick("A +1,+1 mace (weapon in hand)") is None
+
+
+def _corridor_row(text: str) -> tuple[np.ndarray, tuple[int, int]]:
+    """A one-row map: `text` on row 5 from column 10, with the player's '@' in it."""
+    lines = _with(_blank_screen(), 5, 10, text)
+    return screen_to_array(lines), (5, 10 + text.index("@"))
+
+
+def test_zap_targets_report_distance_and_bolt_bounce() -> None:
+    # Monster 2 to the right, wall 3 to the right: a bolt would bounce back.
+    screen, pos = _corridor_row("|.@.H|")
+    targets = RogueEnv._zap_targets(screen, pos)
+    assert targets == [(3, 2, "H", 3)]
+
+    # A door is passed by rays but bounces bolts.
+    screen, pos = _corridor_row("@.+.K......")
+    assert RogueEnv._zap_targets(screen, pos) == [(3, 4, "K", 2)]
+
+
+def _zap_env(pack: dict[str, str], hp: int = 12, max_hp: int = 12) -> RogueEnv:
+    env = _fake_env({}, _room())
+    env._pack = dict(pack)
+    env._status = RogueStatus(hp=hp, max_hp=max_hp)
+    return env
+
+
+def test_bolts_are_zapped_only_when_they_cannot_bounce_back() -> None:
+    env = _zap_env({"f": "A wand of lightning(brass)"})
+    sticks = env._usable_sticks()
+    close_wall = [(3, 2, "H", 3)]
+    far_wall = [(3, 2, "H", 4)]
+    assert env._choose_zap(sticks, close_wall) is None
+    assert env._choose_zap(sticks, far_wall) == ("f", "lightning", "brass", far_wall[0])
+    # Out of a bolt's reach.
+    assert env._choose_zap(sticks, [(3, 7, "H", 99)]) is None
+
+
+def test_fire_is_not_zapped_at_a_dragon() -> None:
+    env = _zap_env({"f": "A wand of fire(brass)"})
+    assert env._choose_zap(env._usable_sticks(), [(3, 2, "D", 99)]) is None
+
+
+def test_teleport_away_when_hurt_and_harmful_sticks_never() -> None:
+    pack = {
+        "f": "A wand of teleport away(iron)",
+        "g": "A wand of haste monster(brass)",
+        "h": "A staff of drain life(oak)",
+    }
+    target = (0, 1, "H", 99)
+    healthy = _zap_env(pack)
+    assert healthy._choose_zap(healthy._usable_sticks(), [target]) is None
+    hurt = _zap_env(pack, hp=4)
+    assert hurt._choose_zap(hurt._usable_sticks(), [target])[:2] == ("f", "teleport away")
+
+
+def test_cancellation_once_per_monster_letter_per_level() -> None:
+    env = _zap_env({"f": "A wand of cancellation(iron)"})
+    sticks = env._usable_sticks()
+    assert env._choose_zap(sticks, [(0, 1, "H", 99)]) is None  # hobgoblin: nothing to cancel
+    assert env._choose_zap(sticks, [(0, 3, "I", 99)])[:2] == ("f", "cancellation")
+    env._zapped_at.add(("cancellation", "I"))
+    assert env._choose_zap(sticks, [(0, 3, "I", 99)]) is None
+
+
+def test_unknown_stick_is_tried_once_at_range_while_healthy() -> None:
+    pack = {"f": "An iron wand"}
+    at_range = [(3, 3, "H", 99)]
+    env = _zap_env(pack)
+    assert env._choose_zap(env._usable_sticks(), at_range) == ("f", None, "iron", at_range[0])
+    assert env._choose_zap(env._usable_sticks(), [(3, 1, "H", 99)]) is None  # adjacent
+    assert _zap_env(pack, hp=6)._choose_zap(env._usable_sticks(), at_range) is None
+    env._tried_stick_materials.add("iron")
+    assert env._choose_zap(env._usable_sticks(), at_range) is None
+
+
+def test_zap_sends_direction_then_slot_and_remembers_an_empty_stick() -> None:
+    lines = _with(_with(_room(), 5, 8, "H"), 5, 7, ".")
+    env = _fake_env(
+        {
+            "zl": _with(lines, 0, 0, "zap with what? (* for list): "),
+            "f": _with(lines, 0, 0, "nothing happens"),
+        },
+        lines,
+    )
+    env._pack = {"f": "A wand of magic missile(brass)"}
+    env._status = RogueStatus(hp=12, max_hp=12)
+
+    zapped, _ = env._try_zap()
+
+    assert zapped is True
+    assert env.client.keys == ["zl", "f"]
+    assert env._usable_sticks() == []  # empty: never zapped again
+
+
+def test_light_is_zapped_in_a_dark_room_once_per_spot() -> None:
+    lines = _room()
+    lit = _with(lines, 0, 0, "the room is lit by a shimmering blue light")
+    env = _fake_env({"zh": _with(lines, 0, 0, "zap with what? "), "f": lit}, lines)
+    env._pack = {"f": "A wand of light(brass)"}
+    env._tile_under_player = "."
+    # Floor seen two tiles away is now drawn blank: Rogue erased it.
+    env._seen_floor_mask[4, 3] = True
+
+    env._try_light()
+    assert env.client.keys == ["zh", "f"]
+    env._try_light()
+    assert env.client.keys == ["zh", "f"]  # not again at the same spot
+
+
+# --- Food and exploration (#22) ---
+
+
+def test_food_count_reads_rations_and_fruit() -> None:
+    env = _fake_env({}, _room())
+    env._pack = {"a": "3 rations of food", "b": "Some food", "c": "2 slime-molds", "d": "A slime-mold"}
+    assert env._food_count() == 7
+
+
+def test_regeneration_ring_comes_off_with_fewer_than_two_rations() -> None:
+    room = _with(_room(), 23, 0, _status_line())
+    removed = _with(room, 0, 0, "was wearing A ring of regeneration(opal)(h)")
+    env = _fake_env({"R": removed, ".": room}, room)
+    env._status = parse_status(room[23]) or RogueStatus()
+    env._pack = {"a": "Some food", "h": "A ring of regeneration(opal) (on left hand)"}
+
+    env._try_auto_rings()
+
+    assert env.client.keys[0] == "R"
+    assert not env._pack["h"].endswith("(on left hand)")
+
+
+def test_exploration_steers_to_the_nearest_unvisited_door() -> None:
+    # A lit room, fully seen and walked, with a door in the right wall.
+    lines = _blank_screen()
+    lines = _with(lines, 3, 2, "-------")
+    lines = _with(lines, 4, 2, "|.....|")
+    lines = _with(lines, 5, 2, "|..@..+")
+    lines = _with(lines, 6, 2, "|.....|")
+    lines = _with(lines, 7, 2, "-------")
+    env = _fake_env({}, lines)
+    screen = screen_to_array(lines)
+    env._seen_mask |= screen[1:23] != ord(" ")
+    env._visited_mask[3:6, 3:8] = True
+
+    mask = env._compute_action_mask(screen, (5, 5))
+
+    assert _legal(mask) == ["l", "u", "n"]
+
+
+def test_with_nothing_to_explore_go_and_search_a_dead_end() -> None:
+    # Fully walked corridor; (5, 2) is a dead end not yet searched.
+    lines = _with(_blank_screen(), 5, 2, "###@##")
+    env = _fake_env({}, lines)
+    screen = screen_to_array(lines)
+    env._seen_mask |= screen[1:23] != ord(" ")
+    env._visited_mask[4, 2:8] = True
+    env._tile_under_player = "#"
+    env._prev_pos = (5, 6)
+    env._search_counts[4, 7] = 6  # the right end is searched out
+
+    mask = env._compute_action_mask(screen, (5, 5))
+
+    assert _legal(mask) == ["h"]
+
+
+def test_no_frontier_steering_with_a_monster_in_view() -> None:
+    # Same room as above, now with a sleeping bat in the far corner.
+    lines = _blank_screen()
+    lines = _with(lines, 3, 2, "-------")
+    lines = _with(lines, 4, 2, "|B....|")
+    lines = _with(lines, 5, 2, "|..@..+")
+    lines = _with(lines, 6, 2, "|.....|")
+    lines = _with(lines, 7, 2, "-------")
+    env = _fake_env({}, lines)
+    screen = screen_to_array(lines)
+    env._seen_mask |= screen[1:23] != ord(" ")
+    env._visited_mask[3:6, 3:8] = True
+
+    mask = env._compute_action_mask(screen, (5, 5))
+
+    assert "h" in _legal(mask)  # not forced toward the door
+
+
+def test_search_cap_grows_with_time_on_the_level() -> None:
+    env = _fake_env({}, _room())
+    assert env._search_cap() == 6
+    env._level_steps = 499
+    assert env._search_cap() == 6
+    env._level_steps = 1000
+    assert env._search_cap() == 18
