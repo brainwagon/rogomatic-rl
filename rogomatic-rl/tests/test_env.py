@@ -1049,23 +1049,29 @@ def test_throws_best_missile_at_ranged_monster_and_updates_stack() -> None:
     assert env.client.keys == [".", "tl", "f"]
     assert "f" not in env._pack
 
-    # Step 2: now throws an arrow ('e') and decrements the stack from 2 to 1.
+    # Step 2: the hobgoblin, 3 away, is too close to be worth wielding the
+    # bow, so an arrow is thrown by hand and the stack goes from 2 to 1.
     env.client.keys.clear()
     env.step(8)  # '.'
     assert env.client.keys == [".", "tl", "e"]
     assert env._pack["e"] == "An +0,+0 arrow"
 
 
-def test_real_rogue_throws_starting_arrow_at_aligned_monster() -> None:
+def test_real_rogue_shoots_from_the_bow_and_puts_the_mace_back() -> None:
     env = RogueEnv(max_steps=10, fixed_dungeons=True)
     try:
-        # Dungeon 1007 starts with a bat aligned to the right of the player in the starting room.
-        env.reset(seed=1007)
+        # Dungeon 1059 starts with a snake 8 squares to the left, in line.
+        env.reset(seed=1059)
         assert env._pack.get("e") == "25 +0,+0 arrows"
-        _, _, terminated, _, info = env.step(8)  # '.'
+        env.step(8)  # '.': the bow is wielded
+        assert env._wielding_bow()
+        _, _, terminated, _, info = env.step(8)  # '.': an arrow is shot
         assert terminated is False
         assert any("arrow" in m.lower() for m in info["messages"])
         assert env._pack.get("e") == "24 +0,+0 arrows"
+        env.step(8)  # '.': the snake is dead or close, the mace goes back
+        assert not env._wielding_bow()
+        assert env._pack["c"].endswith("(weapon in hand)")
     finally:
         env.close()
 
@@ -1737,7 +1743,7 @@ def test_cancellation_once_per_monster_letter_per_level() -> None:
     # An ice monster is left alone while it sleeps ...
     assert env._choose_zap(sticks, [(0, 3, "I", 99)]) is None
     # ... and cancelled once it has woken.
-    env._ice_awake = True
+    env._awake_letters.add("I")
     assert env._choose_zap(sticks, [(0, 3, "I", 99)])[:2] == ("f", "cancellation")
     env._zapped_at.add(("cancellation", "I"))
     assert env._choose_zap(sticks, [(0, 3, "I", 99)]) is None
@@ -2055,7 +2061,7 @@ def test_a_sleeping_ice_monster_is_left_alone_until_it_wakes() -> None:
     env._level_steps = 800
     assert _legal(env._compute_action_mask(screen, (5, 5))) == ["l"]
     env._level_steps = 0
-    env._ice_awake = True
+    env._awake_letters.add("I")
     assert _legal(env._compute_action_mask(screen, (5, 5))) == ["l"]
 
 
@@ -2065,7 +2071,7 @@ def test_an_ice_monster_message_marks_it_awake() -> None:
     env = _fake_env({".": hit}, room)
     env._last_pos = (5, 5)
     env.step(8)
-    assert env._ice_awake
+    assert "I" in env._awake_letters
 
 
 def test_drinks_an_unknown_potion_when_the_next_hit_could_kill() -> None:
@@ -2087,3 +2093,114 @@ def test_drinks_an_unknown_potion_when_the_next_hit_could_kill() -> None:
     env.step(3)  # hp 7: drink the unknown potion
     assert env.client.keys[:3] == ["l", "q", "e"]
     assert "murky" in env._tried_potion_colors
+
+
+def _archery_env(lines: list[str], bow: str = "A +1,+0 short bow") -> RogueEnv:
+    wield_prompt = _with(lines, 0, 0, "wield what? (* for list): ")
+    env = _fake_env(
+        {
+            ".": lines,
+            "w": wield_prompt,
+            "c": _with(lines, 0, 0, "wielding a +1,+1 mace (c)"),
+            "d": _with(lines, 0, 0, "wielding a +1,+0 short bow (d)"),
+            "th": _with(lines, 0, 0, "throw what? (* for list): "),
+            "e": _with(lines, 0, 0, "the arrow hits the hobgoblin"),
+        },
+        lines,
+    )
+    env._last_pos = (5, 9)
+    env._status = parse_status(lines[23]) or RogueStatus()
+    env._inventory_dirty = False
+    env._pack = {
+        "c": "A +1,+1 mace (weapon in hand)",
+        "d": bow,
+        "e": "25 +0,+0 arrows",
+    }
+    return env
+
+
+def _corridor_with(letter: str, col: int) -> list[str]:
+    """A lit room row with the player at (5, 9) and a monster in line to the left."""
+    lines = _with(_blank_screen(), 5, 1, "." * 12)
+    lines = _with(_with(lines, 5, 9, "@"), 5, col, letter)
+    return _with(lines, 23, 0, _status_line(level=2))
+
+
+def test_wields_the_bow_for_a_distant_monster_and_shoots() -> None:
+    env = _archery_env(_corridor_with("H", 2))  # 7 squares away
+    env.step(8)
+    assert env.client.keys == [".", "w", "d"]
+    assert env._wielding_bow()
+
+    env.client.keys.clear()
+    env.step(8)
+    assert env.client.keys == [".", "th", "e"]
+    assert env._pack["e"] == "24 +0,+0 arrows"
+
+
+def test_puts_the_mace_back_when_a_monster_comes_within_three() -> None:
+    env = _archery_env(_corridor_with("H", 6))  # 3 squares away
+    env._pack["c"] = "A +1,+1 mace"
+    env._pack["d"] = "A +1,+0 short bow (weapon in hand)"
+    env.step(8)
+    assert env.client.keys == [".", "w", "c"]
+    assert not env._wielding_bow()
+
+
+def test_no_archery_with_an_unknown_bow_or_at_flying_monsters() -> None:
+    # Without the bow, the arrow is thrown by hand.
+    env = _archery_env(_corridor_with("H", 2), bow="A short bow")
+    env.step(8)
+    assert env.client.keys == [".", "th", "e"]
+
+    env = _archery_env(_corridor_with("K", 2))  # a kestrel
+    env.step(8)
+    assert env.client.keys == [".", "th", "e"]
+
+
+def test_a_monster_that_moves_or_is_named_is_marked_awake() -> None:
+    still = _with(_with(_room(), 5, 8, "C"), 23, 0, _status_line(level=2))
+    moved = _with(_with(_room(), 5, 7, "C"), 23, 0, _status_line(level=2))
+    env = _fake_env({".": still}, still)
+    env._last_pos = (5, 5)
+    env._status = parse_status(still[23]) or RogueStatus()
+    env.step(8)
+    assert "C" not in env._awake_letters  # a centaur that sat still
+    assert "C" in env._ignored_monsters()
+
+    env.client._screens["."] = moved
+    env.step(8)
+    assert "C" in env._awake_letters  # it moved
+    assert "C" not in env._ignored_monsters()
+
+    env2 = _fake_env({".": _with(still, 0, 0, "The yeti misses")}, still)
+    env2._last_pos = (5, 5)
+    env2.step(8)
+    assert "Y" in env2._awake_letters
+
+
+def test_a_sleeping_centaur_next_to_the_player_is_not_attacked() -> None:
+    lines = _with(_with(_room(), 5, 6, "C"), 23, 0, _status_line(level=2))
+    env = _fake_env({}, lines)
+    env._status = parse_status(lines[23]) or RogueStatus()
+    legal = _legal(env._compute_action_mask(screen_to_array(lines), (5, 5)))
+    assert "l" not in legal and "h" in legal
+
+    env._awake_letters.add("C")
+    assert _legal(env._compute_action_mask(screen_to_array(lines), (5, 5))) == ["l"]
+
+
+def test_waits_once_for_an_approaching_monster_two_squares_away() -> None:
+    far = _with(_with(_wide_room(), 5, 2, "H"), 23, 0, _status_line(level=2))
+    near = _with(far, 5, 2, ".H")  # it steps to 2 squares left of (5, 5)
+    env = _fake_env({".": near, "s": near}, far)
+    env._status = parse_status(far[23]) or RogueStatus()
+    env._last_pos = (5, 5)
+    env._last_screen = screen_to_array(far)
+    env._monster_tiles = {(5, 2): "H"}
+    obs, _, _, _, _ = env.step(8)
+    assert _legal(obs["action_mask"]) == ["s"]  # wait for it
+
+    # Having waited once, the agent is free to act again.
+    obs, _, _, _, _ = env.step(9)
+    assert _legal(obs["action_mask"]) != ["s"]

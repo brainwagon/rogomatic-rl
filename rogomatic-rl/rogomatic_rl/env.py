@@ -73,9 +73,26 @@ _MONSTER_MAX_HIT: dict[str, int] = {
 # Below this max hp, rest back to full after any damage: one hobgoblin
 # hit (up to 8) is a large part of a 12 hp character.
 _REST_TO_FULL_MAX_HP = 20
-# Steps on a level after which a sleeping ice monster is no longer left
-# alone, in case it is blocking the only way on.
-_ICE_PATIENCE_STEPS = 800
+# Monsters without ISMEAN in Rogue 5.4 (monsters[] in extern.c).
+# wake_monster (monsters.c) wakes only ISMEAN monsters, so one of these
+# placed asleep stays asleep until it is attacked or hit.  Each is
+# dangerous to wake: centaur, ice monster (freezes: hypothermia),
+# jabberwock, leprechaun (steals gold), nymph (steals an item), wraith
+# (drains a level), xeroc, yeti.  Bats, orcs (ISGREED: they wake near
+# gold) and phantoms (invisible) are fought as usual.
+_SLEEPY_MONSTERS = frozenset("CIJLNWXY")
+# Monster names, to tell which letters a message is about (extern.c).
+_MONSTER_NAMES: dict[str, str] = {
+    "A": "aquator", "B": "bat", "C": "centaur", "D": "dragon", "E": "emu",
+    "F": "venus flytrap", "G": "griffin", "H": "hobgoblin", "I": "ice monster",
+    "J": "jabberwock", "K": "kestrel", "L": "leprechaun", "M": "medusa",
+    "N": "nymph", "O": "orc", "P": "phantom", "Q": "quagga", "R": "rattlesnake",
+    "S": "snake", "T": "troll", "U": "black unicorn", "V": "vampire",
+    "W": "wraith", "X": "xeroc", "Y": "yeti", "Z": "zombie",
+}
+# Steps on a level after which sleeping monsters are no longer left
+# alone, in case one is blocking the only way on.
+_SLEEPER_PATIENCE_STEPS = 800
 _ITEM_CHARS = frozenset({"!", "?", ":", ")", "]", "/", "=", ","})
 # What the agent walks over to collect before descending: items and gold.
 _COLLECT_CHARS = _ITEM_CHARS | {"*"}
@@ -212,14 +229,35 @@ _MISSILE_RE = re.compile(
     re.IGNORECASE,
 )
 _MISSILE_BONUS_RE = re.compile(r"^([+-]\d+),([+-]\d+)\s*$")
+# A short bow with known bonuses, e.g. "A +1,+0 short bow" (the starting
+# one).  An unidentified bow could be cursed, and a cursed bow could not
+# be put down again before melee, so only a known one is used.
+_KNOWN_BOW_RE = re.compile(
+    r"^an?\s+([+-]\d+),([+-]\d+)\s+short bow(?:\s+\(weapon in hand\))?$", re.IGNORECASE
+)
+# Archery ranges, counted after the policy's own move each step.  The
+# bow is wielded for a monster at least _BOW_MIN_RANGE away, arrows are
+# shot at one _BOW_SHOOT_RANGE or more away, and the melee weapon goes
+# back in hand once any monster is within _BOW_PUT_AWAY_RANGE, so it is
+# ready when the monster arrives.  Each weapon change costs a turn.
+_BOW_MIN_RANGE = 6
+_BOW_SHOOT_RANGE = 4
+_BOW_PUT_AWAY_RANGE = 3
+# Not worth arrows: flying monsters move twice a turn while 3 or more
+# squares away (runners in chase.c), and bats do only 1d2 anyway.
+_NO_ARCHERY = frozenset("BGK")
 # Mean thrown damage when wielding a melee weapon (init_dam in weapons.c, roll_em in fight.c).
 _MISSILE_BASE_DAMAGE: dict[str, float] = {
     "shuriken": 5.0,  # 2d4
     "spear": 3.5,     # 1d6
     "dagger": 2.5,    # 1d4
     "dart": 2.0,      # 1d3
-    "arrow": 1.0,     # 1d1 without short bow in hand
+    "arrow": 1.0,     # 1d1 by hand: its 2x3 needs the bow in hand
 }
+# A missile gets its thrown damage only from its launcher (roll_em in
+# fight.c), so an arrow thrown by hand does 1x1 (plus the strength bonus,
+# +1 at 16).  Far enough away the bow is wielded instead
+# (`_try_throw_missile`).
 # Wand and staff pack entries (nameit in things.c).  Charges show only once
 # the stick itself is identified: "A wand of fire [4 charges](brass)".
 _KNOWN_STICK_RE = re.compile(
@@ -320,9 +358,17 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._level_steps: int = 0  # steps taken on the current level
         # Set when resting starts; resting then goes on until full hp.
         self._resting: bool = False
-        # An ice monster has attacked or been attacked on this level.
-        # Ice monsters are not ISMEAN, so one stays asleep unless disturbed.
-        self._ice_awake: bool = False
+        # Monster letters seen awake on this level: one moved, attacked,
+        # was attacked or was named in a fight message.
+        self._awake_letters: set[str] = set()
+        # Monsters on the last screen, and those that moved onto their
+        # tile in the last step, with the distance they came from.
+        self._monster_tiles: dict[tuple[int, int], str] = {}
+        self._approaching: dict[tuple[int, int], int] = {}
+        # The mask allowed only waiting for an approaching monster, and
+        # the agent has just waited once (`_lie_in_wait`).
+        self._wait_forced: bool = False
+        self._lying_in_wait: bool = False
         # Item tiles (screen row, col) already stepped on this level.  An
         # item still drawn there could not be picked up (full pack), so it
         # is never steered to again.
@@ -376,7 +422,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._wall_search_counts.fill(0)
         self._level_steps = 0
         self._resting = False
-        self._ice_awake = False
+        self._clear_monster_tracking()
         self._item_skip.clear()
         self._prev_pos = None
         self._tile_under_player = "."
@@ -434,6 +480,8 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self._steps += 1
         self._level_steps += 1
         action_idx = int(action)
+        # Waited for an approaching monster: do it once, then act (#30).
+        self._lying_in_wait = self._wait_forced and action_idx in (8, 9)
         messages = self.client.send_key(ACTIONS[action_idx])
         lines = self.client.get_lines()
         self._last_lines = lines
@@ -458,7 +506,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             self._wall_search_counts.fill(0)
             self._level_steps = 0
             self._resting = False
-            self._ice_awake = False
+            self._clear_monster_tracking()
             self._item_skip.clear()
             self._zapped_at.clear()
             self._lit_spots.clear()
@@ -534,10 +582,15 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                 curr_pos = find_player(lines)
                 screen_arr = screen_to_array(lines)
 
-        if not self._ice_awake:
-            all_text = " ".join(messages).lower()
-            if "ice monster" in all_text or "frozen" in all_text:
-                self._ice_awake = True
+        self._track_monsters(
+            prev_screen,
+            prev_pos,
+            action_idx,
+            screen_arr,
+            curr_pos,
+            messages,
+            same_level=self._status.level == prev_status.level,
+        )
 
         self._last_pos = curr_pos
 
@@ -1144,6 +1197,16 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
 
         Monsters in `skip` are never targets; they block the line like a wall.
         """
+        target = RogueEnv._missile_target(screen_arr, player_pos, skip)
+        return None if target is None else target[0]
+
+    @staticmethod
+    def _missile_target(
+        screen_arr: np.ndarray,
+        player_pos: Optional[tuple[int, int]],
+        skip: frozenset[str] = frozenset(),
+    ) -> Optional[tuple[str, int]]:
+        """`_find_missile_target`'s direction key, with the monster's distance."""
         if player_pos is None:
             return None
         pr, pc = player_pos
@@ -1172,64 +1235,136 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                         best_dir = ACTIONS[idx]
                     break
                 k += 1
-        return best_dir
+        if best_dir is None or best_dist is None:
+            return None
+        return best_dir, best_dist
 
     def _try_throw_missile(self) -> list[str]:
-        """Throw the highest-scored missile at an aligned monster at range >= 2."""
+        """Shoot or throw at an aligned monster 2 or more squares away.
+
+        From the wielded bow an arrow does 2x3; by hand, 1x1.  Like
+        Rog-O-Matic's archery (strategy.c there): wield the bow for a
+        monster at least `_BOW_MIN_RANGE` away, shoot while one is in line
+        `_BOW_SHOOT_RANGE` or more away, and wield the melee weapon again
+        as soon as any monster is within `_BOW_PUT_AWAY_RANGE`, so the
+        bow's 1x1 is never used in melee.  A monster out of line keeps the
+        bow in hand, so weapons are not swapped back and forth; with none
+        in view `_try_auto_wield` puts the melee weapon back.  Flying
+        monsters (`_NO_ARCHERY`) close too fast to be worth it.  Closer
+        than that, the best missile is thrown by hand: daggers, darts,
+        shuriken and spears need no launcher, and arrows come last.
+        """
         lines = self.client.get_lines()
         player_pos = find_player(lines)
         screen_arr = screen_to_array(lines)
         erased_floor = (screen_arr[1:23] == ord(" ")) & self._seen_floor_mask
         screen_arr[1:23][erased_floor] = ord(".")
-        dir_key = self._find_missile_target(screen_arr, player_pos, self._ignored_monsters())
-        if dir_key is None:
+        ignored = self._ignored_monsters()
+        target = self._missile_target(screen_arr, player_pos, ignored)
+
+        if self._wielding_bow():
+            arrows = self._arrow_slot()
+            close = self._nearest_monster(screen_arr, player_pos, ignored)
+            if arrows is None or (close is not None and close <= _BOW_PUT_AWAY_RANGE):
+                melee = self._best_melee()
+                return [] if melee is None else self._wield(*melee)
+            if (
+                target is not None
+                and target[1] >= _BOW_SHOOT_RANGE
+                and self._target_letter(screen_arr, player_pos, target) not in _NO_ARCHERY
+            ):
+                return self._throw(arrows, target[0])
             return []
 
+        if target is None:
+            return []
+        dir_key, dist = target
         collected: list[str] = []
         if self._inventory_dirty:
             collected.extend(self._refresh_inventory())
 
+        bow = self._bow_slot()
+        if (
+            dist >= _BOW_MIN_RANGE
+            and self._target_letter(screen_arr, player_pos, target) not in _NO_ARCHERY
+            and bow is not None
+            and self._arrow_slot() is not None
+            and not self._weapon_cursed
+        ):
+            collected.extend(self._wield(bow, 0.0))
+            return collected
+
         best_slot: Optional[str] = None
-        best_count: int = 0
         best_score: float = -1e9
         for slot, desc in self._pack.items():
             parsed = self._missile_value(desc)
             if parsed is None:
                 continue
-            count, score = parsed
+            _, score = parsed
             if score > best_score:
                 best_score = score
                 best_slot = slot
-                best_count = count
-
         if best_slot is None:
             return collected
+        collected.extend(self._throw(best_slot, dir_key))
+        return collected
 
-        desc = self._pack[best_slot]
+    @staticmethod
+    def _nearest_monster(
+        screen_arr: np.ndarray, player_pos: Optional[tuple[int, int]], ignored: frozenset[str]
+    ) -> Optional[int]:
+        """Distance in moves to the nearest visible monster not in `ignored`."""
+        if player_pos is None:
+            return None
+        dungeon = screen_arr[1:23]
+        rows, cols = np.nonzero((dungeon >= ord("A")) & (dungeon <= ord("Z")))
+        dists = [
+            max(abs(int(r) + 1 - player_pos[0]), abs(int(c) - player_pos[1]))
+            for r, c in zip(rows, cols)
+            if chr(int(dungeon[r, c])) not in ignored
+        ]
+        return min(dists) if dists else None
+
+    @staticmethod
+    def _target_letter(
+        screen_arr: np.ndarray, player_pos: Optional[tuple[int, int]], target: tuple[str, int]
+    ) -> str:
+        """The monster letter at a `_missile_target` result."""
+        assert player_pos is not None
+        dr, dc = _MOVE_DELTAS[ACTIONS.index(target[0])]
+        return chr(int(screen_arr[player_pos[0] + dr * target[1], player_pos[1] + dc * target[1]]))
+
+    def _throw(self, slot: str, dir_key: str) -> list[str]:
+        """Throw (or shoot) one missile from `slot`; update the pack entry."""
+        desc = self._pack[slot]
+        count = 1
+        match = _MISSILE_RE.match(desc.strip())
+        if match and match.group(1):
+            count = int(match.group(1))
+        collected: list[str] = []
         collected.extend(self.client.send_key(f"t{dir_key}"))
-        throw_msgs = self.client.send_key(best_slot)
+        throw_msgs = self.client.send_key(slot)
         collected.extend(throw_msgs)
         top = self.client.get_lines()[0].lower()
         if "throw what" in top or "direction" in top:
             collected.extend(self.client.send_key("\x1b"))
-            self._pack.pop(best_slot, None)
+            self._pack.pop(slot, None)
             return collected
 
-        if best_count <= 1:
-            self._pack.pop(best_slot, None)
+        if count <= 1:
+            self._pack.pop(slot, None)
         else:
-            rem = best_count - 1
-            match = _MISSILE_RE.match(desc.strip())
+            rem = count - 1
             if match:
                 bonus_part = match.group(2) or ""
                 kind = match.group(3).lower()
                 if rem == 1:
                     article = "An" if kind[0] in "aeiou" else "A"
-                    self._pack[best_slot] = f"{article} {bonus_part}{kind}"
+                    self._pack[slot] = f"{article} {bonus_part}{kind}"
                 else:
-                    self._pack[best_slot] = f"{rem} {bonus_part}{kind}s"
+                    self._pack[slot] = f"{rem} {bonus_part}{kind}s"
             else:
-                self._pack.pop(best_slot, None)
+                self._pack.pop(slot, None)
         return collected
 
     def _food_count(self) -> int:
@@ -1486,19 +1621,104 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         return any("A" <= ch <= "Z" and ch not in ignored for row in lines[1:23] for ch in row)
 
     def _ignored_monsters(self) -> frozenset[str]:
-        """Monster letters to leave alone: an ice monster until it wakes.
+        """Monster letters to leave alone: `_SLEEPY_MONSTERS` not seen awake.
 
-        An ice monster does no damage, but each hit freezes the player for
-        2-3 turns, during which it keeps hitting; more than 50 turns frozen
-        is death by hypothermia (fight.c).  It is not ISMEAN, so it never
-        wakes on its own (wake_monster in monsters.c): left alone, it is
-        harmless.  The agent does not attack it, throw at it or count it
-        as a monster in view until an ice monster has been in a fight, or
-        until `_ICE_PATIENCE_STEPS` on the level, in case it blocks the way.
+        These never wake on their own (wake_monster in monsters.c), so one
+        left alone stays harmless; an ice monster's freezing hits, for
+        one, are what kill by hypothermia.  The agent does not attack,
+        throw at, zap or count as a monster in view any such letter until
+        one has been seen awake on this level (`_track_monsters`), or
+        until `_SLEEPER_PATIENCE_STEPS` on the level, in case one blocks
+        the way.  Seeing a letter awake applies to all of that letter on
+        the level: coarse, but it errs toward fighting.
         """
-        if self._ice_awake or self._level_steps >= _ICE_PATIENCE_STEPS:
+        if self._level_steps >= _SLEEPER_PATIENCE_STEPS:
             return frozenset()
-        return frozenset("I")
+        return _SLEEPY_MONSTERS - self._awake_letters
+
+    def _lie_in_wait(self, player_pos: tuple[int, int], ignored: frozenset[str]) -> bool:
+        """Whether to wait a turn so an approaching monster steps in first.
+
+        The player moves, then the monsters do.  Stepping next to a
+        monster gives it the first swing; letting it step next to the
+        player gives the player the first swing.  Rog-O-Matic waits when a
+        monster is an even number of squares away (tomonster and
+        fightmonster in strategy.c there).  Here: a monster that has just
+        moved closer and is now 2 squares away, waited for once.  Not a
+        dragon, whose flame reaches from a distance.
+        """
+        if self._lying_in_wait:
+            return False
+        pr, pc = player_pos
+        for pos, old_dist in self._approaching.items():
+            letter = self._monster_tiles.get(pos)
+            if letter is None or letter in ignored or letter == "D":
+                continue
+            dist = max(abs(pos[0] - pr), abs(pos[1] - pc))
+            if dist == 2 and old_dist > dist:
+                return True
+        return False
+
+    def _clear_monster_tracking(self) -> None:
+        self._awake_letters.clear()
+        self._monster_tiles = {}
+        self._approaching = {}
+        self._wait_forced = False
+        self._lying_in_wait = False
+
+    def _track_monsters(
+        self,
+        prev_screen: np.ndarray,
+        prev_pos: Optional[tuple[int, int]],
+        action_idx: int,
+        screen_arr: np.ndarray,
+        curr_pos: Optional[tuple[int, int]],
+        messages: list[str],
+        *,
+        same_level: bool,
+    ) -> None:
+        """Note which monsters moved, and which letters are awake.
+
+        Like Rog-O-Matic's sleepmonster / wakemonster (monsters.c there):
+        a monster that moved is awake.  So is one that the agent attacked,
+        or whose name appears in a message ("the centaur hit", "the arrow
+        misses the yeti"); being frozen means an ice monster.  A move is a
+        letter on a new tile with the same letter within 2 tiles of it on
+        the last screen, and no longer on its old tile.
+        """
+        text = " ".join(messages).lower()
+        for letter, name in _MONSTER_NAMES.items():
+            if name in text:
+                self._awake_letters.add(letter)
+        if "frozen" in text:
+            self._awake_letters.add("I")
+        if same_level and self._is_attack(prev_screen, prev_pos, action_idx):
+            dr, dc = _MOVE_DELTAS[action_idx]
+            assert prev_pos is not None
+            self._awake_letters.add(chr(int(prev_screen[prev_pos[0] + dr, prev_pos[1] + dc])))
+
+        dungeon = screen_arr[1:23]
+        rows, cols = np.nonzero((dungeon >= ord("A")) & (dungeon <= ord("Z")))
+        now = {(int(r) + 1, int(c)): chr(int(dungeon[r, c])) for r, c in zip(rows, cols)}
+        approaching: dict[tuple[int, int], int] = {}
+        if same_level:
+            for pos, letter in now.items():
+                if self._monster_tiles.get(pos) == letter:
+                    continue
+                for old, old_letter in self._monster_tiles.items():
+                    if (
+                        old_letter == letter
+                        and now.get(old) != letter
+                        and max(abs(old[0] - pos[0]), abs(old[1] - pos[1])) <= 2
+                    ):
+                        self._awake_letters.add(letter)
+                        if curr_pos is not None:
+                            approaching[pos] = max(
+                                abs(old[0] - curr_pos[0]), abs(old[1] - curr_pos[1])
+                            )
+                        break
+        self._monster_tiles = now
+        self._approaching = approaching
 
     def _run_auto_actions(self) -> list[str]:
         """Run scripted inventory refresh and auto-equip/quaff/read/missile/ring actions."""
@@ -1866,27 +2086,60 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
 
         if best_slot is None:
             return []
+        return self._wield(best_slot, best_score)
 
+    def _wield(self, slot: str, score: float) -> list[str]:
+        """Wield the weapon in `slot`, scored `score` for `_try_auto_wield`."""
         collected: list[str] = []
         w_msgs = self.client.send_key("w")
         collected.extend(w_msgs)
         if "appears to be cursed" in " ".join(w_msgs).lower():
             self._weapon_cursed = True
             return collected
-        wield_msgs = self.client.send_key(best_slot)
+        wield_msgs = self.client.send_key(slot)
         collected.extend(wield_msgs)
         wield_text = " ".join(wield_msgs).lower()
         if "appears to be cursed" in wield_text:
             self._weapon_cursed = True
         elif "wielding" in wield_text:
-            self._weapon_score = best_score
+            self._weapon_score = score
             for s, d in list(self._pack.items()):
                 if d.endswith("(weapon in hand)"):
                     self._pack[s] = d[: -len("(weapon in hand)")].strip()
-            self._pack[best_slot] = f"{self._pack[best_slot]} (weapon in hand)"
+            self._pack[slot] = f"{self._pack[slot]} (weapon in hand)"
         if "wield what" in self.client.get_lines()[0].lower():
             collected.extend(self.client.send_key("\x1b"))
         return collected
+
+    def _bow_slot(self) -> Optional[str]:
+        """The slot of a short bow with known, not negative, bonuses."""
+        for slot, desc in self._pack.items():
+            match = _KNOWN_BOW_RE.match(desc.strip())
+            if match and int(match.group(1)) >= 0 and int(match.group(2)) >= 0:
+                return slot
+        return None
+
+    def _wielding_bow(self) -> bool:
+        return any(
+            "short bow" in desc.lower() and desc.endswith("(weapon in hand)")
+            for desc in self._pack.values()
+        )
+
+    def _arrow_slot(self) -> Optional[str]:
+        for slot, desc in self._pack.items():
+            match = _MISSILE_RE.match(desc.strip())
+            if match and match.group(3).lower() == "arrow":
+                return slot
+        return None
+
+    def _best_melee(self) -> Optional[tuple[str, float]]:
+        """The best melee weapon in the pack, wielded or not, and its score."""
+        best: Optional[tuple[str, float]] = None
+        for slot, desc in self._pack.items():
+            score = self._weapon_value(desc.replace("(weapon in hand)", "").strip())
+            if score is not None and (best is None or score > best[1]):
+                best = (slot, score)
+        return best
 
     @staticmethod
     def _is_attack(
@@ -2258,6 +2511,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         self, screen_arr: np.ndarray, player_pos: Optional[tuple[int, int]]
     ) -> np.ndarray:
         mask = np.ones(len(ACTIONS), dtype=np.uint8)
+        self._wait_forced = False
         if player_pos is not None:
             pr, pc = player_pos
             monster_adjacent = False
@@ -2330,6 +2584,12 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
             if attack_moves:
                 mask[:] = 0
                 mask[attack_moves] = 1
+                return mask
+
+            if self._lie_in_wait(player_pos, ignored):
+                self._wait_forced = True
+                mask[:] = 0
+                mask[9 if self._status.level >= 2 else 8] = 1
                 return mask
 
             # Mask '.' (rest) when at full HP with no adjacent monster
