@@ -1859,6 +1859,53 @@ def test_with_nothing_to_explore_go_and_search_a_dead_end() -> None:
     assert "h" not in _legal(env._compute_action_mask(with_bat, (5, 5)))
 
 
+def _dead_end_corridor() -> tuple[RogueEnv, list[str]]:
+    """The player at a dead end (5, 5), walked from the left, with an
+    unexplored branch going down from (5, 2)."""
+    lines = _with(_blank_screen(), 5, 2, "###@")
+    lines = _with(lines, 6, 2, "#")
+    env = _fake_env({}, lines)
+    screen = screen_to_array(lines)
+    env._seen_mask |= screen[1:23] != ord(" ")
+    env._visited_mask[4, 2:6] = True
+    env._status = RogueStatus(level=2)
+    env._tile_under_player = "#"
+    env._prev_pos = (5, 4)
+    return env, lines
+
+
+def test_a_dead_end_is_searched_when_first_reached() -> None:
+    env, lines = _dead_end_corridor()
+    screen = screen_to_array(lines)
+
+    assert _legal(env._compute_action_mask(screen, (5, 5))) == ["s"]
+
+    # Searched out: back to exploring the branch.
+    env._search_counts[4, 5] = 6
+    assert "s" not in _legal(env._compute_action_mask(screen, (5, 5)))
+    env._search_counts[4, 5] = 0
+
+    # Not on level 1, which hides nothing.
+    env._status = RogueStatus(level=1)
+    assert "s" not in _legal(env._compute_action_mask(screen, (5, 5)))
+
+
+def test_a_dead_end_just_past_a_bend_is_a_dead_end() -> None:
+    #   #@     (5, 5) is a dead end; (6, 4) touches it only diagonally.
+    #   #
+    #   #
+    lines = _with(_blank_screen(), 5, 4, "#@")
+    lines = _with(_with(lines, 6, 4, "#"), 7, 4, "#")
+    env = _fake_env({}, lines)
+    env._tile_under_player = "#"
+
+    tiles = env._dead_end_tiles(screen_to_array(lines), (5, 5))
+
+    assert (5, 5) in tiles
+    assert (5, 4) not in tiles  # the bend itself
+    assert (6, 4) not in tiles
+
+
 def test_no_frontier_steering_with_a_monster_in_view() -> None:
     # Same room as above, now with a sleeping bat in the far corner.
     lines = _blank_screen()

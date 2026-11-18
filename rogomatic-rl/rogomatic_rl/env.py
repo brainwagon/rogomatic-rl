@@ -2338,7 +2338,14 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
     def _dead_end_tiles(
         self, screen_arr: np.ndarray, player_pos: tuple[int, int]
     ) -> list[tuple[int, int]]:
-        """Corridor dead ends (screen row, col) still under the search cap."""
+        """Corridor dead ends (screen row, col) still under the search cap.
+
+        Rogue digs corridors in straight orthogonal runs (conn in
+        passages.c), so a dead end is a corridor tile with one walkable
+        tile beside it orthogonally.  Diagonal neighbours are not
+        counted: one step past a bend, the tile before the bend is a
+        diagonal neighbour of the dead end.
+        """
         dungeon = screen_arr[1:23]
         corridor = dungeon == ord("#")
         pr, pc = player_pos
@@ -2349,7 +2356,7 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
         )
         neighbours = sum(
             walkable[1 + dr : 23 + dr, 1 + dc : 81 + dc].astype(np.int8)
-            for dr, dc in _MOVE_DELTAS
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1))
         )
         dead_end = corridor & (neighbours == 1) & (self._search_counts < self._search_cap())
         rows, cols = np.nonzero(dead_end)
@@ -2713,6 +2720,19 @@ class RogueEnv(gym.Env[dict[str, np.ndarray], int]):
                     pass  # collect visible items before anything else
                 elif self._steer(mask, player_pos, self._stairs_distances(screen_arr)):
                     pass
+                elif (
+                    secrets_possible
+                    and not monster_in_view
+                    and mask[9] == 1
+                    and player_pos in self._dead_end_tiles(screen_arr, player_pos)
+                ):
+                    # At a corridor dead end, search it out before going
+                    # anywhere else: dead ends usually hide a passage, and
+                    # coming back once the rest of the level is explored
+                    # is a long walk.
+                    mask[:] = 0
+                    mask[9] = 1
+                    return mask
                 elif (
                     self._wants_rest(monster_in_view)
                     and self._tile_under_player not in _ITEM_CHARS
